@@ -13,7 +13,13 @@ metadata:
 
 # Eye-in-Hand Visual Servoing ([`Ibvs`](scripts/ibvs.py))
 
-Use bundled [`Ibvs`](scripts/ibvs.py) (`opencv-python numpy`, CPU only, no GPU or `torch`) with calibrated camera intrinsics `(fx_px, fy_px, cx_px, cy_px)` and hand-eye extrinsics `T_ee_cam`:
+Use bundled [`Ibvs`](scripts/ibvs.py) (`opencv-python numpy`, CPU only, no GPU
+or `torch`) with calibrated camera intrinsics `(fx_px, fy_px, cx_px, cy_px)` and
+hand-eye extrinsics `T_ee_cam` (`T_ee_cam` and `T_world_cam` use OpenCV pinhole
+axes `+X` right, `+Y` down, `+Z` forward; from MJCF use
+`mp.get_camera_poses_opencv`, never raw `cam_xmat`; if exact `K`/`T_ee_cam` are
+absent, estimate `K` from approximate FOV and align closed-loop with a 2-nudge
+empirical Jacobian at `1-2 cm` hover clearance per `workspace-calibration`):
 
 1. **Choose the Visual Frontend by Target Texture**:
    - **Smooth / Low-Texture Objects**: Segment the target foreground mask (passing an optional `roi_mask` to exclude any robot/gripper geoms visible in the FOV) and extract pose features via `Ibvs.ray_plane_contour_pose` or `Ibvs.pca_contour_target(..., min_aspect=1.0, roi_mask=roi_mask, prev_theta_rad=...)`. Use `det["anisotropy"]` (`eigval_max / eigval_min`) to decide whether wrist yaw alignment is required vs. keeping neutral wrist roll on symmetric objects.

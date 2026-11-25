@@ -50,6 +50,7 @@ FR3_HW_MAX_JERK_RAD_S3 = np.array(
     [3500.0, 3500.0, 4500.0, 4500.0, 4500.0, 4500.0, 4500.0],
     dtype=np.float64,
 )
+INITIAL_TABLE_LIFT_TOLERANCE_M = 0.015
 
 __all__ = [
     "AbortWatcher",
@@ -95,28 +96,43 @@ def _broadcast_7d_positive(
   return out
 
 
-def validate_joint_waypoints(
-    waypoints_rad: np.ndarray, *, apply_margins: bool = True
-) -> None:
-  """Verifies all `(M, 7)` waypoints lie inside padded FR3 joint limits."""
+def _padded_joint_bounds(
+    *, apply_margins: bool = True
+) -> tuple[np.ndarray, np.ndarray]:
   margins = (
       np.asarray(fr3_mjcf.FR3_IK_MARGINS_RAD, dtype=np.float64)
       if apply_margins
       else np.zeros(7, dtype=np.float64)
   )
-  q_min = fr3_mjcf.FR3_JOINT_LIMITS_RAD[:, 0] + margins
-  q_max = fr3_mjcf.FR3_JOINT_LIMITS_RAD[:, 1] - margins
+  return (
+      fr3_mjcf.FR3_JOINT_LIMITS_RAD[:, 0] + margins,
+      fr3_mjcf.FR3_JOINT_LIMITS_RAD[:, 1] - margins,
+  )
 
-  for wp_idx, q in enumerate(waypoints_rad):
-    if not np.all(np.isfinite(q)):
-      raise ValueError(f"Non-finite joint angle at waypoint {wp_idx}: {q}")
-    for j_idx in range(7):
-      if q[j_idx] < q_min[j_idx] - 1e-9 or q[j_idx] > q_max[j_idx] + 1e-9:
-        raise ValueError(
-            f"Waypoint {wp_idx} joint J{j_idx + 1}={q[j_idx]:.4f} rad "
-            f"violates safe FR3 margin bounds [{q_min[j_idx]:.4f}, "
-            f"{q_max[j_idx]:.4f}] rad"
-        )
+
+def validate_joint_waypoints(
+    waypoints_rad: np.ndarray, *, apply_margins: bool = True
+) -> None:
+  """Verifies all `(M, 7)` waypoints lie inside padded FR3 joint limits."""
+  q_min, q_max = _padded_joint_bounds(apply_margins=apply_margins)
+
+  arr = np.asarray(waypoints_rad, dtype=np.float64)
+  if arr.size == 0:
+    return
+  non_finite = np.argwhere(~np.all(np.isfinite(arr), axis=1))
+  if non_finite.size > 0:
+    wp_idx = int(non_finite[0, 0])
+    raise ValueError(
+        f"Non-finite joint angle at waypoint {wp_idx}: {arr[wp_idx]}"
+    )
+  bad = np.argwhere((arr < q_min - 1e-9) | (arr > q_max + 1e-9))
+  if bad.size > 0:
+    wp_idx, j_idx = int(bad[0, 0]), int(bad[0, 1])
+    raise ValueError(
+        f"Waypoint {wp_idx} joint J{j_idx + 1}={arr[wp_idx, j_idx]:.4f} rad "
+        f"violates safe FR3 margin bounds [{q_min[j_idx]:.4f}, "
+        f"{q_max[j_idx]:.4f}] rad"
+    )
 
 
 def generate_quintic_trajectory(
@@ -312,9 +328,7 @@ def clamp_q_to_padded_limits(
     q_vec: Sequence[float] | np.ndarray,
 ) -> np.ndarray:
   """Clamps a 7-DOF joint vector into FR3's padded IK margin bounds."""
-  margins = np.asarray(fr3_mjcf.FR3_IK_MARGINS_RAD, dtype=np.float64)
-  q_min = fr3_mjcf.FR3_JOINT_LIMITS_RAD[:, 0] + margins
-  q_max = fr3_mjcf.FR3_JOINT_LIMITS_RAD[:, 1] - margins
+  q_min, q_max = _padded_joint_bounds(apply_margins=True)
   return np.clip(np.asarray(q_vec, dtype=np.float64).reshape(7), q_min, q_max)
 
 
@@ -481,15 +495,11 @@ class Fr3DuoSafetyChecker:
     nbody = int(self.mj_model.nbody)
     body_arm_side: list[str] = [""] * nbody
     is_moving_arm_body: list[bool] = [False] * nbody
-    arm_bids: list[int] = []
     arm_gids: list[int] = []
     arm_body_geoms: list[tuple[int, np.ndarray]] = []
     fixed_roots = ("left/fr3_link0", "right/fr3_link0")
     for bid in range(nbody):
-      bname = (
-          mujoco.mj_id2name(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, bid)
-          or ""
-      )
+      bname = self._body_name(bid, default="")
       if bname.startswith("left/"):
         side_tag = "left"
       elif bname.startswith("right/"):
@@ -507,19 +517,22 @@ class Fr3DuoSafetyChecker:
           or int(self.mj_model.geom_conaffinity[gid]) != 0
       ]
       if coll_gids:
-        arm_bids.append(bid)
         arm_gids.extend(coll_gids)
         arm_body_geoms.append((bid, np.asarray(coll_gids, dtype=np.int32)))
 
     self._body_arm_side: tuple[str, ...] = tuple(body_arm_side)
     self._is_moving_arm_body: tuple[bool, ...] = tuple(is_moving_arm_body)
-    self._arm_collision_bids: tuple[int, ...] = tuple(arm_bids)
     self._arm_collision_gids = np.asarray(arm_gids, dtype=np.int32)
     self._arm_body_geoms = tuple(arm_body_geoms)
     self._additive_margin_gap = fr3_mjcf.uses_additive_margin_gap()
+    self._clearance_scale = (
+        0.5 if fr3_mjcf.uses_pairwise_additive_margin() else 1.0
+    )
     resolved_clearance = max(0.0, float(self.config.min_inter_arm_clearance_m))
     self._configured_half_clearance: float | None = (
-        None if mj_model is not None else 0.5 * resolved_clearance
+        None
+        if mj_model is not None
+        else self._clearance_scale * resolved_clearance
     )
 
   def collect_arm_collision_geom_ids(self, side: str) -> list[int]:
@@ -553,18 +566,31 @@ class Fr3DuoSafetyChecker:
         )
     self._configured_half_clearance = half_clearance
 
+  def _body_name(self, bid: int, default: str | None = None) -> str:
+    name = mujoco.mj_id2name(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, bid)
+    return name or (f"body_{bid}" if default is None else default)
+
+  def _geom_name(self, gid: int) -> str:
+    return (
+        mujoco.mj_id2name(self.mj_model, mujoco.mjtObj.mjOBJ_GEOM, gid)
+        or f"geom_{gid}"
+    )
+
   def _check_sample_contacts(
       self,
       scratch: Any,
       idx: int,
       eff_clearance: float,
-  ) -> None:
+      *,
+      allow_table_tolerance_m: float = 0.0,
+  ) -> set[str]:
     mujoco.mj_collision(self.mj_model, scratch)
     table_gid = self._table_gid
     body_arm_side = self._body_arm_side
     is_moving_arm_body = self._is_moving_arm_body
     geom_bodyid = self.mj_model.geom_bodyid
 
+    table_contact_sides: set[str] = set()
     best_dist = float("inf")
     best_pair: tuple[int, int, int, int] | None = None
     for con_i in range(int(scratch.ncon)):
@@ -573,89 +599,48 @@ class Fr3DuoSafetyChecker:
       if dist >= eff_clearance and dist >= 0.0:
         continue
       g1, g2 = int(con.geom1), int(con.geom2)
-      b1 = int(geom_bodyid[g1])
-      b2 = int(geom_bodyid[g2])
-
-      if (
-          dist < 0.0
-          and (
-              (
-                  is_moving_arm_body[b1]
-                  and (g2 == table_gid or not body_arm_side[b2])
-              )
-              or (
-                  is_moving_arm_body[b2]
-                  and (g1 == table_gid or not body_arm_side[b1])
-              )
-              or (
-                  is_moving_arm_body[b1]
-                  and is_moving_arm_body[b2]
-                  and body_arm_side[b1] == body_arm_side[b2]
-              )
-          )
-      ):
-        if is_moving_arm_body[b1] and (
-            not is_moving_arm_body[b2] or body_arm_side[b1] != body_arm_side[b2]
-        ):
-          moving_bid, other_bid = b1, b2
-        else:
-          moving_bid, other_bid = b2, b1
-        moving_name = (
-            mujoco.mj_id2name(
-                self.mj_model, mujoco.mjtObj.mjOBJ_BODY, moving_bid
-            )
-            or f"body_{moving_bid}"
-        )
-        other_name = (
-            "tabletop"
-            if table_gid >= 0 and (g1 == table_gid or g2 == table_gid)
-            else (
-                mujoco.mj_id2name(
-                    self.mj_model, mujoco.mjtObj.mjOBJ_BODY, other_bid
-                )
-                or f"body_{other_bid}"
-            )
-        )
-        raise ValueError(
-            f"Arm link {moving_name!r} collides with {other_name!r} "
-            f"(dist={dist:.4f} m) at sample {idx}"
-        )
-
-      s1 = body_arm_side[b1]
-      s2 = body_arm_side[b2]
-      if (s1 == "left" and s2 == "right") or (s1 == "right" and s2 == "left"):
+      b1, b2 = int(geom_bodyid[g1]), int(geom_bodyid[g2])
+      s1, s2 = body_arm_side[b1], body_arm_side[b2]
+      if s1 and s2 and s1 != s2:
         if dist < best_dist:
           best_dist = dist
           best_pair = (g1, g2, b1, b2)
+        continue
+
+      m1, m2 = is_moving_arm_body[b1], is_moving_arm_body[b2]
+      if dist < 0.0 and (m1 or m2):
+        moving_bid, other_bid = (b1, b2) if (m1 and not m2) else (b2, b1)
+        is_table_hit = table_gid >= 0 and (g1 == table_gid or g2 == table_gid)
+        moving_side = body_arm_side[moving_bid]
+        if (
+            is_table_hit
+            and allow_table_tolerance_m > 0.0
+            and dist >= -allow_table_tolerance_m - 1e-6
+            and moving_side in ("left", "right")
+        ):
+          table_contact_sides.add(moving_side)
+          continue
+        other_name = "tabletop" if is_table_hit else self._body_name(other_bid)
+        raise ValueError(
+            f"Arm link {self._body_name(moving_bid)!r} collides with "
+            f"{other_name!r} (dist={dist:.4f} m) at sample {idx}"
+        )
 
     if best_pair is not None and best_dist < eff_clearance:
       g1, g2, b1, b2 = best_pair
-      b1_name = (
-          mujoco.mj_id2name(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, b1)
-          or f"body_{b1}"
-      )
-      b2_name = (
-          mujoco.mj_id2name(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, b2)
-          or f"body_{b2}"
-      )
       if best_dist < 0.0:
         raise ValueError(
-            f"Inter-arm collision between {b1_name!r} and {b2_name!r} "
+            f"Inter-arm collision between {self._body_name(b1)!r} and "
+            f"{self._body_name(b2)!r} "
             f"(dist={best_dist:.4f} m < {eff_clearance:.4f} m) "
             f"at sample {idx}"
         )
-      g1_name = (
-          mujoco.mj_id2name(self.mj_model, mujoco.mjtObj.mjOBJ_GEOM, g1)
-          or f"geom_{g1}"
-      )
-      g2_name = (
-          mujoco.mj_id2name(self.mj_model, mujoco.mjtObj.mjOBJ_GEOM, g2)
-          or f"geom_{g2}"
-      )
       raise ValueError(
           f"Inter-arm clearance violation: {best_dist:.4f} m < "
-          f"{eff_clearance:.4f} m at sample {idx} ({g1_name} <-> {g2_name})"
+          f"{eff_clearance:.4f} m at sample {idx} "
+          f"({self._geom_name(g1)} <-> {self._geom_name(g2)})"
       )
+    return table_contact_sides
 
   def verify_bimanual_trajectory(
       self,
@@ -664,6 +649,7 @@ class Fr3DuoSafetyChecker:
       *,
       z_table_m: float | None = None,
       min_clearance_m: float | None = None,
+      allow_initial_table_lift: bool = False,
   ) -> None:
     """Verifies `z >= z_table_m`, table collision, and arm clearance."""
     eff_z_table = (
@@ -686,13 +672,23 @@ class Fr3DuoSafetyChecker:
     right_qaddrs = self._arm_qpos_addrs["right"]
     left_site_id = self._left_site_id
     right_site_id = self._right_site_id
+    table_tol = (
+        INITIAL_TABLE_LIFT_TOLERANCE_M if allow_initial_table_lift else 0.0
+    )
 
     with self._lock:
-      self._sync_clearance_margins(0.5 * eff_clearance)
+      self._sync_clearance_margins(self._clearance_scale * eff_clearance)
       scratch = self._safety_scratch_data
       scratch.qpos[:] = self.mj_model.qpos0
 
-      for idx in indices:
+      lift_active = {"left": False, "right": False}
+      needs_clear = {"left": False, "right": False}
+      z_start: dict[str, float] = {}
+      z_prev: dict[str, float] = {}
+      q_prev: dict[str, np.ndarray] = {}
+
+      for sample_pos, raw_idx in enumerate(indices):
+        idx = int(raw_idx)
         ql = traj_left[min(idx, len(traj_left) - 1)]
         qr = traj_right[min(idx, len(traj_right) - 1)]
         for qadr, val in zip(left_qaddrs, ql):
@@ -701,19 +697,84 @@ class Fr3DuoSafetyChecker:
           scratch.qpos[qadr] = float(val)
         mujoco.mj_kinematics(self.mj_model, scratch)
 
+        z_by_side: dict[str, float] = {}
         if left_site_id >= 0:
-          p_left_z = float(scratch.site_xpos[left_site_id, 2])
-          if p_left_z < eff_z_table - 1e-4:
-            raise ValueError(
-                f"Left TCP violates tabletop floor z={p_left_z:.4f} m < "
-                f"z_table_m={eff_z_table:.4f} m at sample {idx}"
-            )
+          z_by_side["left"] = float(scratch.site_xpos[left_site_id, 2])
         if right_site_id >= 0:
-          p_right_z = float(scratch.site_xpos[right_site_id, 2])
-          if p_right_z < eff_z_table - 1e-4:
+          z_by_side["right"] = float(scratch.site_xpos[right_site_id, 2])
+
+        for side, p_z in z_by_side.items():
+          if p_z < eff_z_table - table_tol - 1e-4:
             raise ValueError(
-                f"Right TCP violates tabletop floor z={p_right_z:.4f} m < "
-                f"z_table_m={eff_z_table:.4f} m at sample {idx}"
+                f"{side.capitalize()} TCP violates tabletop floor "
+                f"z={p_z:.4f} m < z_table_m={eff_z_table:.4f} m at sample {idx}"
             )
 
-        self._check_sample_contacts(scratch, int(idx), eff_clearance)
+        table_contact_sides = self._check_sample_contacts(
+            scratch,
+            idx,
+            eff_clearance,
+            allow_table_tolerance_m=table_tol,
+        )
+        if not allow_initial_table_lift:
+          continue
+
+        for side in ("left", "right"):
+          p_z = z_by_side.get(side)
+          q_cur = ql if side == "left" else qr
+          floor_viol = p_z is not None and p_z < eff_z_table - 1e-4
+          has_viol = floor_viol or (side in table_contact_sides)
+          if sample_pos == 0:
+            if has_viol:
+              if p_z is None:
+                raise ValueError(
+                    f"{side.capitalize()} tabletop violation without TCP site "
+                    f"at sample {idx}"
+                )
+              lift_active[side] = True
+              needs_clear[side] = True
+              z_start[side] = p_z
+              z_prev[side] = p_z
+              q_prev[side] = np.asarray(q_cur, dtype=np.float64)
+          elif has_viol:
+            if not lift_active[side]:
+              if floor_viol:
+                raise ValueError(
+                    f"{side.capitalize()} TCP violates tabletop floor "
+                    f"z={p_z:.4f} m < z_table_m={eff_z_table:.4f} m "
+                    f"at sample {idx}"
+                )
+              raise ValueError(
+                  f"{side.capitalize()} arm collides with 'tabletop' "
+                  f"at sample {idx}"
+              )
+            assert p_z is not None
+            is_dup_start = idx == 1 and np.allclose(
+                q_cur, q_prev[side], atol=1e-9
+            )
+            if p_z < z_prev[side] - 1e-9 or (
+                p_z <= z_prev[side] + 1e-9 and not is_dup_start
+            ):
+              raise ValueError(
+                  f"{side.capitalize()} TCP failed to lift strictly away from "
+                  f"tabletop (z={p_z:.4f} m <= prev={z_prev[side]:.4f} m) "
+                  f"at sample {idx}"
+              )
+            z_prev[side] = p_z
+            q_prev[side] = np.asarray(q_cur, dtype=np.float64)
+          elif lift_active[side]:
+            if p_z is not None and p_z <= z_start[side] + 1e-9:
+              raise ValueError(
+                  f"{side.capitalize()} TCP failed to lift strictly away from "
+                  f"tabletop at sample {idx}"
+              )
+            lift_active[side] = False
+            needs_clear[side] = False
+
+      if allow_initial_table_lift:
+        for side in ("left", "right"):
+          if needs_clear[side]:
+            raise ValueError(
+                f"{side.capitalize()} TCP remained in tabletop violation "
+                "without clearing by end of trajectory"
+            )

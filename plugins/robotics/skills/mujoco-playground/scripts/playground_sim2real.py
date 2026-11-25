@@ -30,14 +30,21 @@ def camera_intrinsics_from_model(
 ) -> tuple[np.ndarray, float, float, float, float]:
   """Computes exact MuJoCo pinhole intrinsics K matching mjr_render."""
   ss, intr = model.cam_sensorsize[cam_id], model.cam_intrinsic[cam_id]
-  if float(ss[0]) > 0.0 and float(ss[1]) > 0.0:
+  if (
+      float(ss[0]) > 0.0
+      and float(ss[1]) > 0.0
+      and float(intr[0]) > 0.0
+      and float(intr[1]) > 0.0
+  ):
     fx, fy = float(intr[0] / ss[0] * width), float(intr[1] / ss[1] * height)
     cx = float((0.5 - intr[2] / ss[0]) * width)
-    cy = float((0.5 + intr[3] / ss[1]) * height)
+    cy = float((0.5 - intr[3] / ss[1]) * height)
   else:
     fy = float(0.5 * height / np.tan(0.5 * np.deg2rad(model.cam_fovy[cam_id])))
     fx, cx, cy = fy, 0.5 * float(width), 0.5 * float(height)
-  k = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]])
+  k = np.array(
+      [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64
+  )
   return k, fx, fy, cx, cy
 
 
@@ -51,6 +58,23 @@ def camera_world_pose_opencv(data: mujoco.MjData, cam_id: int) -> np.ndarray:
   """Returns 4x4 T_world_cam in OpenCV (+X right, +Y down, +Z forward) frame."""
   r_cv = data.cam_xmat[cam_id].reshape(3, 3) @ _CV_FROM_MJ_CAM
   return _mat4(r_cv, data.cam_xpos[cam_id])
+
+
+def _compute_rigid_wrist_bodies(
+    model: mujoco.MjModel, last_arm_body: int
+) -> set[int]:
+  """Returns bodies rigidly attached to last_arm_body without moving joints."""
+  rigid_wrist = {int(last_arm_body)}
+  for b in range(1, int(model.nbody)):
+    cur, rigid = b, True
+    while cur > 0 and cur != last_arm_body:
+      if int(model.body_jntnum[cur]) > 0:
+        rigid = False
+        break
+      cur = int(model.body_parentid[cur])
+    if cur == last_arm_body and rigid:
+      rigid_wrist.add(b)
+  return rigid_wrist
 
 
 def solve_site_ik(
@@ -283,6 +307,9 @@ class PlaygroundSim2Real:
     self._finger_qpos_indices = [int(j.qposadr[0]) for j in f_j]
     self._finger_ranges = [(float(j.range[0]), float(j.range[1])) for j in f_j]
 
+    last_arm_body = int(m.jnt_bodyid[int(arm_j[-1].id)])
+    self._rigid_wrist_bodies = _compute_rigid_wrist_bodies(m, last_arm_body)
+
     if device_layer is not None:
       self.device_layer = device_layer
     elif mode == "sim":
@@ -397,7 +424,18 @@ class PlaygroundSim2Real:
       q_arm: ArrayLike | None = None,
       gripper: float | None = None,
   ) -> dict[str, Any]:
-    """Returns calibrated RGB frame, K, T_world_cam, and T_ee_cam in OpenCV frame."""
+    """Returns calibrated RGB frame, K, T_world_cam, and wrist T_ee_cam.
+
+    Args:
+      camera_key: Key in measurements dictionary (e.g. 'wrist_camera').
+      mj_camera_name: Optional explicit MuJoCo camera name.
+      q_arm: Optional arm joint positions for kinematics evaluation.
+      gripper: Optional gripper scalar position.
+
+    Returns:
+      Dict with 'rgb', 'K', 'fx_px', 'fy_px', 'cx_px', 'cy_px', 'T_world_cam',
+      and 'T_ee_cam' (None for fixed scene cameras not on the wrist).
+    """
     rgb = np.asarray(self._measurements[camera_key], dtype=np.uint8)
     cname = mj_camera_name or self._camera_mj_names[camera_key]
     cid = int(self.mj_model.camera(cname).id)
@@ -406,11 +444,26 @@ class PlaygroundSim2Real:
         self.mj_model, cid, rgb.shape[1], rgb.shape[0]
     )
     t_wc = camera_world_pose_opencv(self._fk_data, cid)
-    s = self._ee_site_id
-    t_we = _mat4(self._fk_data.site_xmat[s], self._fk_data.site_xpos[s])
+    cam_body = int(self.mj_model.cam_bodyid[cid])
+    ee_site_body = int(self.mj_model.site_bodyid[self._ee_site_id])
+    if (
+        cam_body in self._rigid_wrist_bodies
+        and ee_site_body in self._rigid_wrist_bodies
+    ):
+      s = self._ee_site_id
+      t_we = _mat4(self._fk_data.site_xmat[s], self._fk_data.site_xpos[s])
+      t_ee_cam = np.linalg.inv(t_we) @ t_wc
+    else:
+      t_ee_cam = None
     return dict(
-        rgb=rgb, K=k, fx_px=fx, fy_px=fy, cx_px=cx, cy_px=cy,
-        T_world_cam=t_wc, T_ee_cam=np.linalg.inv(t_we) @ t_wc,
+        rgb=rgb,
+        K=k,
+        fx_px=fx,
+        fy_px=fy,
+        cx_px=cx,
+        cy_px=cy,
+        T_world_cam=t_wc,
+        T_ee_cam=t_ee_cam,
     )
 
   def _context_qpos(self, gripper: float | None = None) -> np.ndarray:

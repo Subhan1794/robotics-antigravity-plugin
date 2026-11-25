@@ -2766,6 +2766,20 @@ def _body_is_descendant(
   return cur == root_body_id
 
 
+def _is_rigid_descendant(
+    model: mujoco.MjModel, body_id: int, ancestor_body_id: int
+) -> bool:
+  """Checks if body_id descends from ancestor_body_id with zero moving joints."""
+  if not _body_is_descendant(model, body_id, ancestor_body_id):
+    return False
+  cur = int(body_id)
+  while cur > 0 and cur != ancestor_body_id:
+    if int(model.body_jntnum[cur]) > 0:
+      return False
+    cur = int(model.body_parentid[cur])
+  return True
+
+
 def _body_lca(model: mujoco.MjModel, b1: int, b2: int) -> int:
   """Returns lowest common ancestor body ID of `b1` and `b2`."""
   anc1: set[int] = set()
@@ -6335,7 +6349,16 @@ def _apply_joint_positions_to_mjdata(
 
 
 def _build_mjcf_camera_lookup(model: mujoco.MjModel) -> dict[str, int]:
-  """Maps full, short, and `*_rgb_image` camera keys to MuJoCo `cam_id`."""
+  """Maps full, unambiguous short, and `*_rgb_image` keys to MuJoCo `cam_id`."""
+  short_counts: dict[str, int] = {}
+  for cid in range(int(model.ncam)):
+    cn = (
+        mujoco.mj_id2name(model, int(mujoco.mjtObj.mjOBJ_CAMERA), cid)
+        or f"cam_{cid}"
+    )
+    sh = cn.split("/")[-1]
+    short_counts[sh] = short_counts.get(sh, 0) + 1
+
   lookup: dict[str, int] = {}
   for cid in range(int(model.ncam)):
     cname = (
@@ -6343,18 +6366,52 @@ def _build_mjcf_camera_lookup(model: mujoco.MjModel) -> dict[str, int]:
         or f"cam_{cid}"
     )
     short = cname.split("/")[-1]
-    for alias in (
+    aliases: list[str] = [
         cname,
-        short,
-        f"{short}_rgb_image",
         f"{cname}_rgb_image",
-        f"{short}_rgb",
-        f"{short}_color",
-        f"{short}_image",
-    ):
+        f"{cname}_rgb",
+        f"{cname}_color",
+        f"{cname}_image",
+    ]
+    if short_counts.get(short, 0) == 1:
+      aliases.extend((
+          short,
+          f"{short}_rgb_image",
+          f"{short}_rgb",
+          f"{short}_color",
+          f"{short}_image",
+          f"scene/{short}",
+      ))
+    for alias in aliases:
       if alias not in lookup:
         lookup[alias] = int(cid)
   return lookup
+
+
+_CV_FROM_MJ_CAM: np.ndarray = np.diag([1.0, -1.0, -1.0])
+
+
+def _camera_pinhole_from_mjmodel(
+    model: mujoco.MjModel, cam_id: int, width: int, height: int
+) -> tuple[float, float, float, float]:
+  """Computes pinhole intrinsics (fx, fy, cx, cy) matching MuJoCo projection."""
+  sensorsize = np.asarray(model.cam_sensorsize[cam_id], dtype=np.float64)
+  intrinsic = np.asarray(model.cam_intrinsic[cam_id], dtype=np.float64)
+  if (
+      sensorsize[0] > 0.0
+      and sensorsize[1] > 0.0
+      and intrinsic[0] > 0.0
+      and intrinsic[1] > 0.0
+  ):
+    fx = float(intrinsic[0] / sensorsize[0] * width)
+    fy = float(intrinsic[1] / sensorsize[1] * height)
+    cx = float((0.5 - intrinsic[2] / sensorsize[0]) * width)
+    cy = float((0.5 - intrinsic[3] / sensorsize[1]) * height)
+  else:
+    fovy = math.radians(float(model.cam_fovy[cam_id]))
+    fx = fy = float(0.5 * height / math.tan(0.5 * fovy))
+    cx, cy = 0.5 * float(width), 0.5 * float(height)
+  return (fx, fy, cx, cy)
 
 
 def get_camera_poses_in_robot_frame(
@@ -6367,6 +6424,12 @@ def get_camera_poses_in_robot_frame(
     left_joint_pos: Sequence[float] | np.ndarray | None = None,
 ) -> dict[str, dict[str, Any]]:
   """Returns camera `(pos, rot)` in the robot MJCF root frame.
+
+  Note: `rot` uses MuJoCo's camera coordinate convention (+X right, +Y up,
+  -Z forward along optical axis), matching `pixel_to_ray`,
+  `intersect_ray_plane`, `triangulate_pixels`, and `project_point`. For OpenCV
+  pinhole consumers (+X right, +Y down, +Z forward, such as `rgb_localization`
+  and `ibvs`), use `get_camera_poses_opencv`.
 
   Pair these extrinsics with runtime camera intrinsics (`focal_px`,
   `principal_point_px`) for ray-plane projection and stereo triangulation so all
@@ -6385,6 +6448,15 @@ def get_camera_poses_in_robot_frame(
   )
   mujoco.mj_forward(model, data)
 
+  short_counts: dict[str, int] = {}
+  for cid in range(int(model.ncam)):
+    cn = (
+        mujoco.mj_id2name(model, int(mujoco.mjtObj.mjOBJ_CAMERA), cid)
+        or f"cam_{cid}"
+    )
+    sh = cn.split("/")[-1]
+    short_counts[sh] = short_counts.get(sh, 0) + 1
+
   out: dict[str, dict[str, Any]] = {}
   for cid in range(int(model.ncam)):
     cname = (
@@ -6394,10 +6466,193 @@ def get_camera_poses_in_robot_frame(
     short = cname.split("/")[-1]
     pos = np.asarray(data.cam_xpos[cid], dtype=np.float64).copy()
     rot = np.asarray(data.cam_xmat[cid], dtype=np.float64).reshape(3, 3).copy()
-    entry = {"pos": pos, "rot": rot, "mjcf_name": cname}
+    entry = {
+        "pos": pos,
+        "rot": rot,
+        "convention": "mujoco",
+        "mjcf_name": cname,
+    }
     out[cname] = entry
-    out[short] = entry
-    out[f"{short}_rgb_image"] = entry
+    out[f"{cname}_rgb_image"] = entry
+    if short_counts.get(short, 0) == 1:
+      out[short] = entry
+      out[f"{short}_rgb_image"] = entry
+  return out
+
+
+def get_camera_poses_opencv(
+    mjcf_path: str | None = None,
+    joint_positions: (
+        Mapping[str, Any] | Sequence[float] | np.ndarray | None
+    ) = None,
+    right_joint_pos: Sequence[float] | np.ndarray | None = None,
+    *,
+    left_joint_pos: Sequence[float] | np.ndarray | None = None,
+    image_size: Sequence[int] | tuple[int, int] | None = None,
+) -> dict[str, dict[str, Any]]:
+  """Returns camera extrinsics and pinhole intrinsics in OpenCV camera convention.
+
+  Unlike MuJoCo's camera convention (+X right, +Y up, -Z forward), OpenCV
+  pinhole cameras look along +Z forward with +Y pointing down (+X right,
+  +Y down, +Z forward; R_cv = R_mj @ diag(1, -1, -1)).
+
+  For wrist-mounted cameras attached to a discovered robot arm with an
+  end-effector site, this function also computes
+  `T_ee_cam = inv(T_world_ee) @ T_world_cam`, which remains invariant under
+  joint movement.
+
+  Args:
+    mjcf_path: Path to robot MJCF model.
+    joint_positions: Optional joint positions dictionary, list, or array.
+    right_joint_pos: Optional joint positions for right arm.
+    left_joint_pos: Optional joint positions for left arm.
+    image_size: Optional (width, height) in pixels to compute pinhole
+      intrinsics K.
+
+  Returns:
+    Dictionary mapping camera keys to camera metadata containing:
+      - "pos": (3,) camera position in robot root frame
+      - "rot": (3, 3) rotation matrix in OpenCV convention (+Z forward)
+      - "convention": Camera frame convention ("opencv")
+      - "T_world_cam": 4x4 transform from camera to robot root frame
+      - "T_ee_cam": 4x4 transform from camera to arm end-effector site, or None
+      - "K": 3x3 pinhole intrinsic matrix, or None if image size is unknown
+      - "fx_px", "fy_px", "cx_px", "cy_px": Pinhole parameters, or None
+      - "arm": Discovered arm name ("left", "right", "arm"), or None
+      - "ee_site_name": Discovered end-effector site name, or None
+      - "mjcf_name": Full camera name in MJCF
+  """
+  model = mujoco.MjModel.from_xml_path(_resolve_mjcf_path(mjcf_path))
+  data = mujoco.MjData(model)
+  eff_jp = (
+      left_joint_pos
+      if (joint_positions is None and left_joint_pos is not None)
+      else joint_positions
+  )
+  _apply_joint_positions_to_mjdata(
+      model, data, eff_jp, right_joint_pos=right_joint_pos
+  )
+  mujoco.mj_forward(model, data)
+
+  arm_specs = _discover_robot_arms(model)
+  body_to_arm: dict[int, _DiscoveredArmSpec] = {}
+  for spec in arm_specs.values():
+    if not spec.joint_ids:
+      continue
+    last_b = int(model.jnt_bodyid[spec.joint_ids[-1]])
+    for b in range(1, int(model.nbody)):
+      if _is_rigid_descendant(model, b, last_b):
+        body_to_arm[b] = spec
+
+  short_counts: dict[str, int] = {}
+  for cid in range(int(model.ncam)):
+    cn = (
+        mujoco.mj_id2name(model, int(mujoco.mjtObj.mjOBJ_CAMERA), cid)
+        or f"cam_{cid}"
+    )
+    sh = cn.split("/")[-1]
+    short_counts[sh] = short_counts.get(sh, 0) + 1
+
+  fixed_w_px, fixed_h_px = 0, 0
+  if image_size is not None:
+    if isinstance(image_size, (str, bytes)) or len(image_size) != 2:
+      raise ValueError(
+          f"image_size must be positive (width, height); got {image_size!r}."
+      )
+    if isinstance(image_size[0], bool) or isinstance(image_size[1], bool):
+      raise ValueError(
+          f"image_size must be positive (width, height); got {image_size!r}."
+      )
+    fixed_w_px, fixed_h_px = int(image_size[0]), int(image_size[1])
+    if fixed_w_px <= 0 or fixed_h_px <= 0:
+      raise ValueError(
+          f"image_size must be positive (width, height); got {image_size!r}."
+      )
+
+  out: dict[str, dict[str, Any]] = {}
+  for cid in range(int(model.ncam)):
+    cname = (
+        mujoco.mj_id2name(model, int(mujoco.mjtObj.mjOBJ_CAMERA), cid)
+        or f"cam_{cid}"
+    )
+    short = cname.split("/")[-1]
+    pos = np.asarray(data.cam_xpos[cid], dtype=np.float64).copy()
+    rot_mj = np.asarray(data.cam_xmat[cid], dtype=np.float64).reshape(3, 3)
+    rot_cv = (rot_mj @ _CV_FROM_MJ_CAM).copy()
+    t_world_cam = make_transform(pos, rot_cv)
+
+    cam_body = int(model.cam_bodyid[cid])
+    spec = body_to_arm.get(cam_body)
+    if spec is not None:
+      arm_name = spec.arm_name
+      last_b = int(model.jnt_bodyid[spec.joint_ids[-1]])
+      if spec.ee_site_id >= 0 and _is_rigid_descendant(
+          model, int(model.site_bodyid[spec.ee_site_id]), last_b
+      ):
+        ee_pos = np.asarray(data.site_xpos[spec.ee_site_id], dtype=np.float64)
+        ee_rot = np.asarray(
+            data.site_xmat[spec.ee_site_id], dtype=np.float64
+        ).reshape(3, 3)
+        t_world_ee = make_transform(ee_pos, ee_rot)
+        t_ee_cam = invert_transform(t_world_ee) @ t_world_cam
+        ee_site_name = spec.ee_site_name
+      elif spec.ee_site_id < 0:
+        ee_pos = np.asarray(data.xpos[last_b], dtype=np.float64)
+        ee_rot = np.asarray(data.xmat[last_b], dtype=np.float64).reshape(3, 3)
+        t_world_ee = make_transform(ee_pos, ee_rot)
+        t_ee_cam = invert_transform(t_world_ee) @ t_world_cam
+        ee_site_name = None
+      else:
+        t_ee_cam = None
+        ee_site_name = None
+    else:
+      t_ee_cam = None
+      arm_name = None
+      ee_site_name = None
+
+    w_px, h_px = fixed_w_px, fixed_h_px
+    if (
+        image_size is None
+        and getattr(model, "cam_resolution", None) is not None
+    ):
+      res = np.asarray(model.cam_resolution[cid], dtype=int)
+      if (
+          res.size >= 2
+          and int(res[0]) > 0
+          and int(res[1]) > 0
+          and (int(res[0]) > 1 or int(res[1]) > 1)
+      ):
+        w_px, h_px = int(res[0]), int(res[1])
+
+    if w_px > 0 and h_px > 0:
+      fx, fy, cx, cy = _camera_pinhole_from_mjmodel(model, cid, w_px, h_px)
+      k_mat = np.array(
+          [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64
+      )
+    else:
+      k_mat = fx = fy = cx = cy = None
+
+    entry = {
+        "pos": pos,
+        "rot": rot_cv,
+        "convention": "opencv",
+        "T_world_cam": t_world_cam,
+        "T_ee_cam": t_ee_cam,
+        "K": k_mat,
+        "fx_px": fx,
+        "fy_px": fy,
+        "cx_px": cx,
+        "cy_px": cy,
+        "arm": arm_name,
+        "ee_site_name": ee_site_name,
+        "mjcf_name": cname,
+    }
+    out[cname] = entry
+    out[f"{cname}_rgb_image"] = entry
+    if short_counts.get(short, 0) == 1:
+      out[short] = entry
+      out[f"{short}_rgb_image"] = entry
+
   return out
 
 
@@ -6443,6 +6698,41 @@ def _extract_cam_intrinsics_tuple(
     cam_intrinsics_entry: Mapping[str, Any],
 ) -> tuple[float, float, float, float]:
   """Extracts `(fx, fy, cx, cy)` from a camera intrinsics mapping entry."""
+  if (
+      "focal_px" in cam_intrinsics_entry
+      and "principal_point_px" in cam_intrinsics_entry
+      and cam_intrinsics_entry["focal_px"] is not None
+      and cam_intrinsics_entry["principal_point_px"] is not None
+  ):
+    focal = cam_intrinsics_entry["focal_px"]
+    pp = cam_intrinsics_entry["principal_point_px"]
+    return float(focal[0]), float(focal[1]), float(pp[0]), float(pp[1])
+  if (
+      cam_intrinsics_entry.get("fx_px") is not None
+      and cam_intrinsics_entry.get("fy_px") is not None
+      and cam_intrinsics_entry.get("cx_px") is not None
+      and cam_intrinsics_entry.get("cy_px") is not None
+  ):
+    return (
+        float(cam_intrinsics_entry["fx_px"]),
+        float(cam_intrinsics_entry["fy_px"]),
+        float(cam_intrinsics_entry["cx_px"]),
+        float(cam_intrinsics_entry["cy_px"]),
+    )
+  if cam_intrinsics_entry.get("K") is not None:
+    k_mat = np.asarray(cam_intrinsics_entry["K"], dtype=np.float64)
+    if k_mat.shape == (3, 3):
+      return (
+          float(k_mat[0, 0]),
+          float(k_mat[1, 1]),
+          float(k_mat[0, 2]),
+          float(k_mat[1, 2]),
+      )
+  if "fx_px" in cam_intrinsics_entry or "K" in cam_intrinsics_entry:
+    raise ValueError(
+        "Camera intrinsics entry has None intrinsics; pass image_size=(W, H)"
+        " to get_camera_poses_opencv or provide focal_px/principal_point_px."
+    )
   focal = cam_intrinsics_entry["focal_px"]
   pp = cam_intrinsics_entry["principal_point_px"]
   return float(focal[0]), float(focal[1]), float(pp[0]), float(pp[1])
@@ -6452,17 +6742,34 @@ def _lookup_camera_entry(
     mapping: Mapping[str, Mapping[str, Any]], cam_key: str
 ) -> Mapping[str, Any]:
   """Looks up `cam_key` across short, `*_rgb_image`, and MJCF camera keys."""
-  short = cam_key.removesuffix("_rgb_image").removesuffix("_rgb").split("/")[-1]
-  for cand in (cam_key, f"{short}_rgb_image", short, f"scene/{short}"):
+  base_key = cam_key.removesuffix("_rgb_image").removesuffix("_rgb")
+  short = base_key.split("/")[-1]
+  for cand in (
+      cam_key,
+      base_key,
+      f"{base_key}_rgb_image",
+      f"{short}_rgb_image",
+      short,
+      f"scene/{short}",
+  ):
     entry = mapping.get(cand)
     if entry is not None:
       return entry
+  matches: dict[str, Mapping[str, Any]] = {}
   for k, v in mapping.items():
     if (
         k.removesuffix("_rgb_image").removesuffix("_rgb").split("/")[-1]
         == short
     ):
-      return v
+      mjcf_name = str(v.get("mjcf_name", k))
+      matches[mjcf_name] = v
+  if len(matches) == 1:
+    return next(iter(matches.values()))
+  if len(matches) > 1:
+    raise KeyError(
+        f"Camera key {cam_key!r} is ambiguous across multiple matching cameras:"
+        f" {sorted(matches.keys())!r}. Use full namespaced camera key."
+    )
   raise KeyError(
       f"Camera {cam_key!r} not found in mapping keys {list(mapping.keys())!r}."
   )
@@ -6482,13 +6789,22 @@ def pixel_to_ray(
     cam_pose: Single camera entry `{'pos': ..., 'rot': ...}` from
       `get_camera_poses_in_robot_frame(...)`.
     cam_intrinsics: Single camera entry `{'focal_px': [fx, fy],
-      'principal_point_px': [cx, cy]}`.
+      'principal_point_px': [cx, cy]}` (or `'fx_px'/'fy_px'/'cx_px'/'cy_px'`).
 
   Returns:
     Tuple `(origin, unit_dir)` as `float64` arrays of shape `(3,)` in the
     robot MJCF root frame.
   """
+  if cam_pose.get("convention") == "opencv":
+    raise ValueError(
+        "pixel_to_ray expects MuJoCo (-Z forward) camera poses from"
+        " get_camera_poses_in_robot_frame; got OpenCV (+Z forward) pose."
+    )
   fx, fy, cx, cy = _extract_cam_intrinsics_tuple(cam_intrinsics)
+  if fx <= 0.0 or fy <= 0.0:
+    raise ValueError(
+        f"Camera focal lengths must be positive; got fx={fx}, fy={fy}."
+    )
   origin = np.asarray(cam_pose["pos"], dtype=np.float64).reshape(3).copy()
   rot = np.asarray(cam_pose["rot"], dtype=np.float64).reshape(3, 3)
   d_cam = np.array(
@@ -6767,6 +7083,11 @@ def render_scene_overlay(
   Supports both `(mjcf_path, joint_positions, camera_image_paths, scene,
   output_path, ...)` and legacy `(mjcf_path, left_q, right_q,
   camera_image_paths, scene, output_path, ...)` calling conventions.
+
+  Raises:
+    KeyError: If an un-namespaced camera key is ambiguous across multiple MJCF
+      cameras sharing that leaf name.
+    TypeError: If positional or keyword arguments have invalid types.
   """
   # Normalize legacy 6-positional-arg vs new 5-positional/keyword signatures
   legacy_right_q: Sequence[float] | np.ndarray | None = right_joint_pos
@@ -6819,6 +7140,14 @@ def render_scene_overlay(
   mujoco.mj_forward(model, data)
 
   cam_lookup = _build_mjcf_camera_lookup(model)
+  short_counts: dict[str, int] = {}
+  for cid in range(int(model.ncam)):
+    cn = (
+        mujoco.mj_id2name(model, int(mujoco.mjtObj.mjOBJ_CAMERA), cid)
+        or f"cam_{cid}"
+    )
+    sh = cn.split("/")[-1]
+    short_counts[sh] = short_counts.get(sh, 0) + 1
 
   panels: list[Image.Image] = []
   for cam_key, img_path in real_img_paths.items():
@@ -6829,15 +7158,25 @@ def render_scene_overlay(
     overlay = Image.new("RGBA", (img_w, img_h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
 
-    short_key = (
-        cam_key.removesuffix("_rgb_image").removesuffix("_rgb").split("/")[-1]
+    base_key = cam_key
+    for sfx in ("_rgb_image", "_rgb", "_color", "_image"):
+      if base_key.endswith(sfx):
+        base_key = base_key[: -len(sfx)]
+        break
+    short_key = base_key.split("/")[-1]
+    cam_id = cam_lookup.get(
+        cam_key, cam_lookup.get(base_key, cam_lookup.get(short_key, -1))
     )
-    cam_id = cam_lookup.get(cam_key, cam_lookup.get(short_key, -1))
     if cam_id < 0:
       cid = mujoco.mj_name2id(model, int(mujoco.mjtObj.mjOBJ_CAMERA), cam_key)
       if cid >= 0:
         cam_id = int(cid)
     if cam_id < 0:
+      if short_counts.get(short_key, 0) > 1 and "/" not in base_key:
+        raise KeyError(
+            f"Camera key {cam_key!r} is ambiguous across multiple MJCF cameras"
+            " sharing that leaf name; use the full namespaced camera key."
+        )
       continue
 
     cam_pos = np.asarray(data.cam_xpos[cam_id], dtype=np.float64).copy()
@@ -6851,26 +7190,27 @@ def render_scene_overlay(
         spec_entry = _lookup_camera_entry(real_intrinsics, cam_key)
       except KeyError:
         spec_entry = {}
-    if "focal_px" in spec_entry and "principal_point_px" in spec_entry:
-      fx, fy = float(spec_entry["focal_px"][0]), float(
-          spec_entry["focal_px"][1]
-      )
-      cx, cy = (
-          float(spec_entry["principal_point_px"][0]),
-          float(spec_entry["principal_point_px"][1]),
-      )
+    has_explicit_intrinsics = (
+        (
+            "focal_px" in spec_entry
+            and "principal_point_px" in spec_entry
+            and spec_entry["focal_px"] is not None
+            and spec_entry["principal_point_px"] is not None
+        )
+        or (
+            spec_entry.get("fx_px") is not None
+            and spec_entry.get("fy_px") is not None
+            and spec_entry.get("cx_px") is not None
+            and spec_entry.get("cy_px") is not None
+        )
+        or spec_entry.get("K") is not None
+    )
+    if has_explicit_intrinsics:
+      fx, fy, cx, cy = _extract_cam_intrinsics_tuple(spec_entry)
     else:
-      sensorsize = np.asarray(model.cam_sensorsize[cam_id], dtype=np.float64)
-      intrinsic = np.asarray(model.cam_intrinsic[cam_id], dtype=np.float64)
-      if sensorsize[0] > 0.0 and intrinsic[0] > 0.0:
-        fx = float(intrinsic[0] / sensorsize[0] * img_w)
-        fy = float(intrinsic[1] / sensorsize[1] * img_h)
-        cx = float((img_w - 1.0) / 2.0 + intrinsic[2] / sensorsize[0] * img_w)
-        cy = float((img_h - 1.0) / 2.0 + intrinsic[3] / sensorsize[1] * img_h)
-      else:
-        fovy = math.radians(float(model.cam_fovy[cam_id]))
-        fx = fy = float(0.5 * img_h / math.tan(0.5 * fovy))
-        cx, cy = (img_w - 1.0) / 2.0, (img_h - 1.0) / 2.0
+      fx, fy, cx, cy = _camera_pinhole_from_mjmodel(
+          model, cam_id, img_w, img_h
+      )
 
     labeled_groups: set[str] = set()
     for prim in real_scene.primitives:

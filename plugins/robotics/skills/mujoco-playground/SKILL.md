@@ -16,8 +16,8 @@ metadata:
 Compose live MuJoCo Studio visualization, perception, IK, collision-aware planning, and visual servoing on `mujoco_playground`'s out-of-the-box `so101` and `yam` 50 Hz `DeviceLayer` stacks with identical code in `mode="sim"` and `mode="real"`:
 
 1. **Workspace Setup**:
-   - Clone and sync: `git clone https://github.com/google-deepmind/mujoco_playground.git && cd mujoco_playground && make sync-cpu` (or `make sync` / `make sync-cu12` on Linux CUDA; add `uv sync --extra so101` or `--extra yam --default-index https://pypi.org/simple` on robot hosts, and pass `--no-sync` to `uv run`).
-   - Install composed skill packages into `.venv`: `uv pip install --python .venv/bin/python --default-index https://pypi.org/simple ruckig opencv-python-headless scipy mink daqp`. Set `MUJOCO_GL=osmesa` only on headless Linux (omit on macOS).
+   - Clone & sync: `git clone https://github.com/google-deepmind/mujoco_playground.git && cd mujoco_playground && make sync-cpu` (or `make sync` for CUDA 13 / `make sync-cu12` for Linux CUDA 12; add `--extra so101` or `--extra yam` alongside the same `--group`, and pass `--no-sync` to `uv run`). For composed skills, run `uv pip install --python .venv/bin/python ruckig opencv-python-headless scipy mink daqp`. Set `MUJOCO_GL=osmesa` only on headless Linux (omit on macOS).
+   - Hardware bringup & CLI (also runnable without cloning via `uvx --python 3.13 --from "playground[so101]>=1.1"`): identify/calibrate SO-101 with `uv run --no-sync python -m mujoco_playground.robots.so101.real.{get_ports --identify --roles=follower, get_cameras --identify, get_calibration --roles=follower}`, and run tasks via `uv run --no-sync playground <train|play|deploy|teleop|sysid|view_log>`.
 
 2. **Unified `sim` / `real` `DeviceLayer` Execution ([`PlaygroundSim2Real`](scripts/playground_sim2real.py))**:
    - Wrap `SO101Follower` / `SO101FollowerDevice` (`so101_aloha_table`, arm in `rad`, gripper in `[0, 100]`) or `YamFollower` / `YamFollowerDevice` (`yam_aloha_table`, arm in `rad`, gripper in `[0, 1]`) via `with PlaygroundSim2Real(robot="yam", mode="sim", setup_scene=...) as env:`, passing `setup_scene(spec)` (`mujoco-spec-editing` / `mujoco-python`) to customize objects, containers, conveyors, or camera/base poses for any scene.
@@ -42,9 +42,12 @@ Compose live MuJoCo Studio visualization, perception, IK, collision-aware planni
    - **`rgb-object-localization`**: Call
      `cam = env.camera_opencv("wrist_camera")` (computes `K`, `T_world_cam`, and
      `T_ee_cam` from measured `q_arm` via `mj_kinematics` + `mj_camlight` with
-     MuJoCo-to-OpenCV `R @ diag([1, -1, -1])` applied) and pass
-     `(mask, cam["K"], cam["T_world_cam"], z_plane_m)` to
-     `ray_plane_contour_pose` or two views to `triangulate_matched_points`.
+     MuJoCo-to-OpenCV `R @ diag([1, -1, -1])` applied; `cam["T_ee_cam"]` is
+     `None` for fixed `extra_cameras`) and pass
+     `(mask, cam["K"], cam["T_world_cam"], z_plane_m)` (tabletop at
+     `z_plane_m = env.table_height_m` in Playground world frame plus object
+     height offset) to `ray_plane_contour_pose` or two views to
+     `triangulate_matched_points`.
    - **`i2rt-yam-ik` & Arm IK**: On `yam`, map world targets into the arm base frame (computed dynamically from `env.mj_model` via `env.t_world_base`) with `p_b = env.world_to_base_point(p_w)` before `YamIk(xml_path=env.robot_xml_path).make_topdown_grasp_pose(*p_b)` + `ik.solve(...)` (or transform full poses with `env.world_to_base_pose`). On 5-DOF `so101` (or either arm), call `env.solve_arm_ik(pos_world, approach_dir_world=(0, 0, -1), jaw_yaw_rad=...)`.
    - **`motion-planning` (`motion_planner` `mp`)**: Transform world obstacles into the robot MJCF root frame via `env.world_to_base_point` / `env.world_to_base_pose` (`table` at `z = 0.0` in base frame), plan free-space detours and linear Cartesian strokes with `planner = mp.RobotArmPlanner(mjcf_path=env.robot_xml_path, joint_names=env.arm_joint_names, gripper_cmd=env.gripper_normalized)` (`planner.plan_arm` / `planner.plan_cartesian_stroke`, `control_dt_s=env.control_period_s`), and stream via `env.execute_trajectory(res["q_trajectory"])`.
    - **`visual-servoing` (`Ibvs`)**: Compute unoccluded hover height with `Ibvs.principal_ray_hover_distance(cam["T_ee_cam"], env.approach_axis_ee)`, refine wrist alignment at hover via `Ibvs.ray_plane_contour_pose(mask, cam["fx_px"], cam["fy_px"], cam["cx_px"], cam["cy_px"], cam["T_world_cam"], z_plane_m)` (or 6-DOF `Ibvs.compute_step`), then descend, close gripper (`env.set_gripper(...)`), and lift.

@@ -25,13 +25,14 @@ Supports:
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 import configparser
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field, fields
 import os
 from pathlib import Path
 import time
 from typing import Any
+import warnings
 
 import numpy as np
 
@@ -121,6 +122,227 @@ class CameraStreamSpec:
         fps=int(data.get("fps", 30)),
         zed_conf_path=str(data.get("zed_conf_path", "")),
     )
+
+
+class _DictCompatMixin:
+  """Read-only mapping accessors delegating to fields or `to_dict()`."""
+
+  _dict_delegate_to_dict: bool = False
+
+  def to_dict(self) -> dict[str, Any]:
+    """Returns a dictionary representation of this dataclass."""
+    return asdict(self)  # type: ignore[arg-type]
+
+  def _field_names(self) -> set[str]:
+    return {f.name for f in fields(self)}  # type: ignore[arg-type]
+
+  def __getitem__(self, key: str) -> Any:
+    if not self._dict_delegate_to_dict and key in self._field_names():
+      val = getattr(self, key)
+      if key == "error" and val is None:
+        raise KeyError(key)
+      return val
+    return self.to_dict()[key]
+
+  def get(self, key: str, default: Any = None) -> Any:
+    """Returns `self[key]` if present, otherwise `default`."""
+    try:
+      return self[key]
+    except KeyError:
+      return default
+
+  def __contains__(self, key: object) -> bool:
+    if not isinstance(key, str):
+      return False
+    if not self._dict_delegate_to_dict:
+      if key == "error":
+        return getattr(self, "error", None) is not None
+      if key in self._field_names():
+        return True
+    return key in self.to_dict()
+
+  def keys(self) -> Any:
+    return self.to_dict().keys()
+
+  def items(self) -> Any:
+    return self.to_dict().items()
+
+  def values(self) -> Any:
+    return self.to_dict().values()
+
+  def __iter__(self) -> Iterator[str]:
+    return iter(self.to_dict())
+
+  def __len__(self) -> int:
+    return len(self.to_dict())
+
+
+@dataclass
+class CameraCalibration(_DictCompatMixin):
+  """OpenCV intrinsics, base/EE extrinsics, and optional ZED rectification."""
+
+  _dict_delegate_to_dict = True
+
+  width: int
+  height: int
+  K: np.ndarray
+  intrinsics_tuple: tuple[float, float, float, float]
+  mp_intrinsics: dict[str, list[float]]
+  T_base_cam: np.ndarray = field(
+      default_factory=lambda: np.eye(4, dtype=np.float64)
+  )
+  T_ee_cam: np.ndarray | None = None
+  mj_pose: dict[str, np.ndarray] = field(default_factory=dict)
+  P: np.ndarray | None = None
+  R_rect: np.ndarray | None = None
+  baseline_m: float | None = None
+  rectified: bool = False
+  conf_path: str | None = None
+
+  def to_dict(self) -> dict[str, Any]:
+    """Returns a dictionary view omitting unset rectification fields."""
+    out: dict[str, Any] = {
+        "width": int(self.width),
+        "height": int(self.height),
+        "K": self.K,
+        "intrinsics_tuple": self.intrinsics_tuple,
+        "mp_intrinsics": self.mp_intrinsics,
+        "T_base_cam": self.T_base_cam,
+        "T_ee_cam": self.T_ee_cam,
+        "mj_pose": self.mj_pose,
+    }
+    if (
+        self.rectified
+        or self.P is not None
+        or self.R_rect is not None
+        or self.baseline_m is not None
+        or self.conf_path is not None
+    ):
+      if self.P is not None:
+        out["P"] = self.P
+      if self.R_rect is not None:
+        out["R_rect"] = self.R_rect
+      if self.baseline_m is not None:
+        out["baseline_m"] = self.baseline_m
+      out["rectified"] = bool(self.rectified)
+      if self.conf_path is not None:
+        out["conf_path"] = self.conf_path
+    return out
+
+
+@dataclass
+class UvcDeviceInfo(_DictCompatMixin):
+  """Discovered Linux V4L2/UVC camera device metadata."""
+
+  name: str
+  family: str
+  device_path: str
+  video_node: str
+  serial: str
+  vendor_id: str
+  product_id: str
+  busnum: str
+  usb_speed_mbps: float
+  is_usb3: bool
+  interface: str
+  power_control: str
+  udev_aliases: list[str] = field(default_factory=list)
+  side_hint: str = ""
+  v4l2_rw_ok: bool | None = None
+
+
+@dataclass
+class UsbPermissionsReport(_DictCompatMixin):
+  """Linux `video`/`dialout` group and device R/W permission report."""
+
+  groups: list[str]
+  in_video_group: bool
+  in_dialout_group: bool
+  v4l2_access_issues: list[UvcDeviceInfo | dict[str, Any]] = field(
+      default_factory=list
+  )
+  serial_access_issues: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class ZedEyeIntrinsics(_DictCompatMixin):
+  """Single-eye intrinsics and distortion coefficients from ZED `.conf`."""
+
+  fx: float
+  fy: float
+  cx: float
+  cy: float
+  k1: float
+  k2: float
+  p1: float
+  p2: float
+  k3: float
+  K: list[list[float]]
+  dist_coeffs: list[float]
+
+
+@dataclass
+class ZedStereoExtrinsics(_DictCompatMixin):
+  """Stereo baseline and relative rotation/translation from ZED `.conf`."""
+
+  baseline_mm: float
+  baseline_m: float
+  ty_mm: float
+  tz_mm: float
+  rx: float
+  cv: float
+  rz: float
+
+
+@dataclass
+class ZedCalibration(_DictCompatMixin):
+  """Parsed Stereolabs ZED factory calibration for one resolution."""
+
+  resolution: str
+  left: ZedEyeIntrinsics
+  right: ZedEyeIntrinsics
+  stereo: ZedStereoExtrinsics
+
+
+@dataclass
+class ZedRectificationEntry:
+  """Cached OpenCV stereo rectification remap tables and matrices."""
+
+  m1_l: np.ndarray
+  m2_l: np.ndarray
+  m1_r: np.ndarray
+  m2_r: np.ndarray
+  r1: np.ndarray
+  r2: np.ndarray
+  p1: np.ndarray
+  p2: np.ndarray
+  width: int
+  height: int
+  conf_path: str
+
+
+@dataclass
+class CameraFreshnessEntry(_DictCompatMixin):
+  """Freshness and pixel-statistics summary for one camera stream."""
+
+  ok: bool
+  max_age_s: float
+  timestamps_advancing: bool
+  pixels_changing: bool
+  brightness_mean: float
+  pixel_std: float
+  width: int
+  height: int
+  backend: str
+
+
+@dataclass
+class CameraFreshnessReport(_DictCompatMixin):
+  """Aggregate camera freshness report across all configured streams."""
+
+  ok: bool
+  cameras: dict[str, CameraFreshnessEntry] = field(default_factory=dict)
+  errors: list[str] = field(default_factory=list)
 
 
 def _read_sysfs_text(path: Path) -> str:
@@ -239,7 +461,7 @@ def discover_uvc_devices(
     v4l_by_id: Path = Path("/dev/v4l/by-id"),
     v4l_by_path: Path = Path("/dev/v4l/by-path"),
     dev_root: Path = Path("/dev"),
-) -> list[dict[str, Any]]:
+) -> list[UvcDeviceInfo]:
   """Discovers ZED Mini and RealSense RGB V4L2 camera nodes on Linux."""
   if not sys_v4l.is_dir():
     return []
@@ -266,21 +488,15 @@ def discover_uvc_devices(
 
   for vdir in sorted(sys_v4l.iterdir(), key=lambda p: p.name):
     node_index = _read_sysfs_text(vdir / "index")
+    if node_index and (not node_index.isdigit() or int(node_index) % 2 != 0):
+      continue
     name = _read_sysfs_text(vdir / "name") or vdir.name
     usb_info = _inspect_usb_ancestors(vdir)
     family = _classify_camera_family(name, usb_info["vendor_id"])
-    if family is None:
+    if family is None or (
+        family != "realsense" and node_index not in ("", "0")
+    ):
       continue
-    if node_index:
-      if family == "realsense":
-        try:
-          if int(node_index) % 2 != 0:
-            continue
-        except ValueError:
-          if node_index != "0":
-            continue
-      elif node_index != "0":
-        continue
 
     cand_node = dev_root / vdir.name
     dev_node = str(cand_node) if cand_node.exists() else f"/dev/{vdir.name}"
@@ -318,7 +534,7 @@ def discover_uvc_devices(
         "family": family,
     })
 
-  devices: list[dict[str, Any]] = []
+  devices: list[UvcDeviceInfo] = []
   for item in raw_v4l:
     usb_info = item["usb_info"]
     ser = usb_info["serial"]
@@ -357,33 +573,35 @@ def discover_uvc_devices(
         if Path(item["dev_node"]).exists()
         else None
     )
-    devices.append({
-        "name": item["name"],
-        "family": item["family"],
-        "device_path": item["device_path"],
-        "video_node": item["dev_node"],
-        "serial": ser,
-        "vendor_id": usb_info["vendor_id"],
-        "product_id": usb_info["product_id"],
-        "busnum": usb_info["busnum"],
-        "usb_speed_mbps": item["speed_val"],
-        "is_usb3": bool(item["speed_val"] >= 5000.0),
-        "interface": usb_info["interface"],
-        "power_control": usb_info["power_control"],
-        "udev_aliases": item_aliases,
-        "side_hint": side_hint,
-        "v4l2_rw_ok": v4l2_rw_ok,
-    })
+    devices.append(
+        UvcDeviceInfo(
+            name=item["name"],
+            family=item["family"],
+            device_path=item["device_path"],
+            video_node=item["dev_node"],
+            serial=ser,
+            vendor_id=usb_info["vendor_id"],
+            product_id=usb_info["product_id"],
+            busnum=usb_info["busnum"],
+            usb_speed_mbps=item["speed_val"],
+            is_usb3=bool(item["speed_val"] >= 5000.0),
+            interface=usb_info["interface"],
+            power_control=usb_info["power_control"],
+            udev_aliases=item_aliases,
+            side_hint=side_hint,
+            v4l2_rw_ok=v4l2_rw_ok,
+        )
+    )
 
   return devices
 
 
 def check_linux_usb_permissions(
-    uvc_devices: list[dict[str, Any]] | None = None,
+    uvc_devices: Sequence[UvcDeviceInfo | Mapping[str, Any]] | None = None,
     *,
-    serial_ports: list[dict[str, Any]] | None = None,
+    serial_ports: Sequence[Mapping[str, Any]] | None = None,
     group_names_override: set[str] | None = None,
-) -> dict[str, Any]:
+) -> UsbPermissionsReport:
   """Checks Linux `video`/`dialout` group membership and device R/W access."""
   if group_names_override is not None:
     group_set = set(group_names_override)
@@ -417,13 +635,64 @@ def check_linux_usb_permissions(
       if str(s.get("device_role_hint", "")) != "teleop_or_ft232h"
       and s.get("serial_rw_ok") is False
   ]
-  return {
-      "groups": sorted(group_set),
-      "in_video_group": "video" in group_set,
-      "in_dialout_group": "dialout" in group_set,
-      "v4l2_access_issues": v4l2_issues,
-      "serial_access_issues": serial_issues,
-  }
+  return UsbPermissionsReport(
+      groups=sorted(group_set),
+      in_video_group="video" in group_set,
+      in_dialout_group="dialout" in group_set,
+      v4l2_access_issues=v4l2_issues,
+      serial_access_issues=serial_issues,
+  )
+
+
+def _iter_glob_zed_dirs() -> list[Path]:
+  """Finds vendor/site ZED settings directories via shallow prefix globs."""
+  dirs: list[Path] = []
+  for root in (Path("/usr/local"), Path("/opt")):
+    try:
+      dirs.extend(sorted(root.glob("*/zed/settings")))
+    except OSError:
+      pass
+  return dirs
+
+
+def _safe_iterdir(directory: Path) -> list[Path]:
+  """Returns sorted entries of `directory`, or `[]` if unreadable."""
+  try:
+    return sorted(directory.iterdir(), key=lambda p: p.name)
+  except OSError:
+    return []
+
+
+def _find_zed_conf_in_dirs(
+    dirs: Sequence[Path], clean_serial: str
+) -> Path | None:
+  existing_dirs = []
+  for d in dirs:
+    try:
+      if d.is_dir():
+        existing_dirs.append(d)
+    except OSError:
+      continue
+  if clean_serial:
+    target_name = f"sn{clean_serial.lower()}.conf"
+    for d in existing_dirs:
+      for f in _safe_iterdir(d):
+        if f.is_file() and f.name.lower() == target_name:
+          return f
+    if clean_serial.isdigit():
+      return None
+
+  for d in existing_dirs:
+    confs = [
+        f
+        for f in _safe_iterdir(d)
+        if f.is_file()
+        and f.name.lower().startswith("sn")
+        and f.name.lower().endswith(".conf")
+    ]
+    if len(confs) == 1:
+      return confs[0]
+  return None
 
 
 def resolve_zed_conf_path(
@@ -433,18 +702,21 @@ def resolve_zed_conf_path(
     *,
     env: Mapping[str, str] | None = None,
 ) -> Path | None:
-  """Locates factory ZED `SN<serial>.conf` file across standard search paths."""
+  """Locates factory ZED `SN<serial>.conf` across file, dir, env, and globs."""
+  candidate_dirs: list[Path] = []
   if explicit_path:
     p = Path(explicit_path)
     if p.is_file():
       return p
+    if p.is_dir():
+      candidate_dirs.append(p)
 
   env_map = os.environ if env is None else env
-  candidate_dirs: list[Path] = [
+  candidate_dirs.extend(
       Path(part.strip())
       for part in env_map.get("ZED_SETTINGS_DIR", "").split(os.pathsep)
       if part.strip()
-  ]
+  )
   if search_dirs:
     candidate_dirs.extend(
         Path(sdir) for sdir in search_dirs if str(sdir).strip()
@@ -452,29 +724,17 @@ def resolve_zed_conf_path(
   candidate_dirs.extend([
       Path("/usr/local/zed/settings"),
       Path.home() / "zed" / "settings",
+      Path.home() / ".config" / "zed" / "settings",
   ])
-  existing_dirs = [d for d in candidate_dirs if d.is_dir()]
 
   clean_serial = str(serial).strip()
-  if clean_serial:
-    target_name = f"sn{clean_serial.lower()}.conf"
-    for d in existing_dirs:
-      for f in d.iterdir():
-        if f.is_file() and f.name.lower() == target_name:
-          return f
-    return None
+  if clean_serial.lower().startswith("sn") and len(clean_serial) > 2:
+    clean_serial = clean_serial[2:].strip()
 
-  for d in existing_dirs:
-    confs = [
-        f
-        for f in d.iterdir()
-        if f.is_file()
-        and f.name.lower().startswith("sn")
-        and f.name.lower().endswith(".conf")
-    ]
-    if len(confs) == 1:
-      return confs[0]
-  return None
+  found = _find_zed_conf_in_dirs(candidate_dirs, clean_serial)
+  if found is not None:
+    return found
+  return _find_zed_conf_in_dirs(_iter_glob_zed_dirs(), clean_serial)
 
 
 def split_zed_sbs_frame(
@@ -503,7 +763,9 @@ def split_zed_sbs_frame(
   )
 
 
-def _parse_zed_cam_section(sec: configparser.SectionProxy) -> dict[str, Any]:
+def _parse_zed_cam_section(
+    sec: configparser.SectionProxy,
+) -> ZedEyeIntrinsics:
   fx = float(sec.get("fx", 0.0))
   fy = float(sec.get("fy", 0.0))
   cx = float(sec.get("cx", 0.0))
@@ -513,24 +775,43 @@ def _parse_zed_cam_section(sec: configparser.SectionProxy) -> dict[str, Any]:
   p1 = float(sec.get("p1", 0.0))
   p2 = float(sec.get("p2", 0.0))
   k3 = float(sec.get("k3", 0.0))
-  return {
-      "fx": fx,
-      "fy": fy,
-      "cx": cx,
-      "cy": cy,
-      "k1": k1,
-      "k2": k2,
-      "p1": p1,
-      "p2": p2,
-      "k3": k3,
-      "K": [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
-      "dist_coeffs": [k1, k2, p1, p2, k3],
-  }
+  return ZedEyeIntrinsics(
+      fx=fx,
+      fy=fy,
+      cx=cx,
+      cy=cy,
+      k1=k1,
+      k2=k2,
+      p1=p1,
+      p2=p2,
+      k3=k3,
+      K=[[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
+      dist_coeffs=[k1, k2, p1, p2, k3],
+  )
+
+
+_ZED_RESOLUTION_ALIASES: dict[str, tuple[str, ...]] = {
+    "HD720": ("HD720", "HD"),
+    "HD": ("HD", "HD720"),
+    "HD1080": ("HD1080", "FHD"),
+    "FHD": ("FHD", "HD1080"),
+    "HD2K": ("HD2K", "2K"),
+    "2K": ("2K", "HD2K"),
+    "VGA": ("VGA", "WVGA"),
+    "WVGA": ("WVGA", "VGA"),
+}
+
+_ZED_NATIVE_EYE_SIZES: frozenset[tuple[int, int]] = frozenset({
+    (2208, 1242),
+    (1920, 1080),
+    (1280, 720),
+    (672, 376),
+})
 
 
 def parse_zed_conf(
     conf_path: str | Path, resolution: str = "HD720"
-) -> dict[str, Any]:
+) -> ZedCalibration:
   """Parses a Stereolabs ZED factory calibration `.conf` INI file."""
   path = Path(conf_path)
   if not path.is_file():
@@ -540,46 +821,53 @@ def parse_zed_conf(
   parser = configparser.ConfigParser(strict=False)
   parser.read(path, encoding="utf-8")
 
-  left_sec_name = f"LEFT_CAM_{res}"
-  right_sec_name = f"RIGHT_CAM_{res}"
-  if left_sec_name not in parser or right_sec_name not in parser:
+  tags = _ZED_RESOLUTION_ALIASES.get(res, (res,))
+  matched_tag: str | None = None
+  for tag in tags:
+    if f"LEFT_CAM_{tag}" in parser and f"RIGHT_CAM_{tag}" in parser:
+      matched_tag = tag
+      break
+  if matched_tag is None:
+    left_sec_name = f"LEFT_CAM_{res}"
+    right_sec_name = f"RIGHT_CAM_{res}"
     raise ValueError(
         f"Sections [{left_sec_name}] / [{right_sec_name}] missing in {path} "
         f"(available: {parser.sections()})"
     )
 
+  left_sec_name = f"LEFT_CAM_{matched_tag}"
+  right_sec_name = f"RIGHT_CAM_{matched_tag}"
   stereo_sec = parser["STEREO"] if "STEREO" in parser else {}
   baseline_mm = float(
       stereo_sec.get("baseline", stereo_sec.get("Baseline", 63.0))
       if stereo_sec
       else 63.0
   )
-  return {
-      "resolution": res,
-      "left": _parse_zed_cam_section(parser[left_sec_name]),
-      "right": _parse_zed_cam_section(parser[right_sec_name]),
-      "stereo": {
-          "baseline_mm": baseline_mm,
-          "baseline_m": baseline_mm / 1000.0,
-          "ty_mm": float(stereo_sec.get("ty", 0.0)) if stereo_sec else 0.0,
-          "tz_mm": float(stereo_sec.get("tz", 0.0)) if stereo_sec else 0.0,
-          "rx": (
-              float(stereo_sec.get(f"rx_{res.lower()}", 0.0))
-              if stereo_sec
-              else 0.0
-          ),
-          "cv": (
-              float(stereo_sec.get(f"cv_{res.lower()}", 0.0))
-              if stereo_sec
-              else 0.0
-          ),
-          "rz": (
-              float(stereo_sec.get(f"rz_{res.lower()}", 0.0))
-              if stereo_sec
-              else 0.0
-          ),
-      },
-  }
+  stereo_tags = [matched_tag] + [t for t in tags if t != matched_tag]
+
+  def _stereo_angle(prefix: str) -> float:
+    if not stereo_sec:
+      return 0.0
+    for tag in stereo_tags:
+      key = f"{prefix}_{tag.lower()}"
+      if key in stereo_sec:
+        return float(stereo_sec[key])
+    return 0.0
+
+  return ZedCalibration(
+      resolution=res,
+      left=_parse_zed_cam_section(parser[left_sec_name]),
+      right=_parse_zed_cam_section(parser[right_sec_name]),
+      stereo=ZedStereoExtrinsics(
+          baseline_mm=baseline_mm,
+          baseline_m=baseline_mm / 1000.0,
+          ty_mm=float(stereo_sec.get("ty", 0.0)) if stereo_sec else 0.0,
+          tz_mm=float(stereo_sec.get("tz", 0.0)) if stereo_sec else 0.0,
+          rx=_stereo_angle("rx"),
+          cv=_stereo_angle("cv"),
+          rz=_stereo_angle("rz"),
+      ),
+  )
 
 
 def _is_sbs_stereo_spec(spec: CameraStreamSpec) -> bool:
@@ -705,6 +993,138 @@ def _read_override_frame(source: Any) -> tuple[np.ndarray, float, str]:
   raise TypeError(f"Unsupported camera override payload: {type(raw)!r}")
 
 
+def build_sim_camera_frames(
+    rendered: Mapping[str, np.ndarray],
+    timestamp_s: float,
+) -> dict[str, CameraFrame]:
+  """Wraps rendered MuJoCo `(H, W, 3)` RGB arrays into `CameraFrame`s."""
+  frames: dict[str, CameraFrame] = {}
+  for cam_name in CANONICAL_CAMERAS:
+    rgb = np.ascontiguousarray(rendered[cam_name], dtype=np.uint8)
+    frames[cam_name] = CameraFrame(
+        name=cam_name,
+        rgb=rgb,
+        timestamp_s=float(timestamp_s),
+        width=int(rgb.shape[1]),
+        height=int(rgb.shape[0]),
+        backend="mujoco_sim",
+    )
+  return frames
+
+
+def _cal_get(
+    cal: CameraCalibration | Mapping[str, Any], key: str, default: Any = None
+) -> Any:
+  return (
+      getattr(cal, key, default)
+      if isinstance(cal, CameraCalibration)
+      else cal.get(key, default)
+  )
+
+
+def _cal_set(
+    cal: CameraCalibration | dict[str, Any], key: str, value: Any
+) -> None:
+  if isinstance(cal, CameraCalibration):
+    setattr(cal, key, value)
+  else:
+    cal[key] = value
+
+
+def scale_camera_calibration(
+    cam_cal: CameraCalibration | dict[str, Any],
+    width: int,
+    height: int,
+) -> None:
+  """Scales OpenCV intrinsics in `cam_cal` in-place to `(width, height)`."""
+  cal_w = int(_cal_get(cam_cal, "width", width))
+  cal_h = int(_cal_get(cam_cal, "height", height))
+  if width <= 0 or height <= 0 or cal_w <= 0 or cal_h <= 0:
+    return
+  if width == cal_w and height == cal_h:
+    return
+  sx = float(width) / float(cal_w)
+  sy = float(height) / float(cal_h)
+  k_mat = np.array(_cal_get(cam_cal, "K"), dtype=np.float64, copy=True)
+  k_mat[0, 0] *= sx
+  k_mat[0, 2] *= sx
+  k_mat[1, 1] *= sy
+  k_mat[1, 2] *= sy
+  fx, fy = float(k_mat[0, 0]), float(k_mat[1, 1])
+  cx, cy = float(k_mat[0, 2]), float(k_mat[1, 2])
+  updates = {
+      "width": int(width),
+      "height": int(height),
+      "K": k_mat,
+      "intrinsics_tuple": (fx, fy, cx, cy),
+      "mp_intrinsics": {
+          "focal_px": [fx, fy],
+          "principal_point_px": [cx, cy],
+      },
+  }
+  for key, val in updates.items():
+    _cal_set(cam_cal, key, val)
+
+
+def apply_rectified_camera_calibration(
+    calibration: dict[str, Any],
+    rectified_calibration: (
+        Mapping[str, CameraCalibration | Mapping[str, Any]] | None
+    ),
+) -> dict[str, Any]:
+  """Overrides `calibration` in-place with active rectified ZED intrinsics."""
+  if not rectified_calibration:
+    return calibration
+  for cam_name, rect_entry in rectified_calibration.items():
+    target = calibration.get(cam_name)
+    if target is None:
+      continue
+    rect_map = (
+        rect_entry.to_dict()
+        if isinstance(rect_entry, CameraCalibration)
+        else rect_entry
+    )
+    k_mat = np.asarray(rect_map["K"], dtype=np.float64).copy()
+    intr_vals = tuple(float(v) for v in rect_map["intrinsics_tuple"])
+    was_rectified = bool(_cal_get(target, "rectified", False))
+    _cal_set(target, "width", int(rect_map["width"]))
+    _cal_set(target, "height", int(rect_map["height"]))
+    _cal_set(target, "K", k_mat)
+    _cal_set(
+        target,
+        "intrinsics_tuple",
+        (intr_vals[0], intr_vals[1], intr_vals[2], intr_vals[3]),
+    )
+    _cal_set(
+        target,
+        "mp_intrinsics",
+        {
+            "focal_px": [float(k_mat[0, 0]), float(k_mat[1, 1])],
+            "principal_point_px": [float(k_mat[0, 2]), float(k_mat[1, 2])],
+        },
+    )
+    for extra_key in ("P", "R_rect", "baseline_m", "rectified", "conf_path"):
+      if extra_key in rect_map:
+        val = rect_map[extra_key]
+        _cal_set(
+            target,
+            extra_key,
+            np.asarray(val, dtype=np.float64).copy()
+            if isinstance(val, np.ndarray)
+            else val,
+        )
+    if not was_rectified:
+      raw_r = _cal_get(target, "R_rect")
+      raw_t = _cal_get(target, "T_base_cam")
+      if raw_r is not None and raw_t is not None:
+        r_rect = np.asarray(raw_r, dtype=np.float64)
+        if r_rect.shape == (3, 3):
+          t_bc = np.asarray(raw_t, dtype=np.float64).copy()
+          t_bc[:3, :3] = t_bc[:3, :3] @ r_rect.T
+          _cal_set(target, "T_base_cam", t_bc)
+  return calibration
+
+
 class Fr3DuoCameraController:
   """Unified 4-camera capture controller for Franka Research 3 Duo."""
 
@@ -737,58 +1157,154 @@ class Fr3DuoCameraController:
     self._opened = False
     self._handles: dict[str, tuple[Any, str, tuple[str, ...]]] = {}
     self._zed_rectify_cache: dict[
-        tuple[str, int, int], tuple[Any, Any, Any, Any]
+        tuple[str, int, int], ZedRectificationEntry | None
     ] = {}
+    self._last_zed_rectification: ZedRectificationEntry | None = None
+    self._zed_rectify_warned: set[tuple[str, int, int]] = set()
+    self._zed_conf_fallback_cache: dict[tuple[str, str], str] = {}
     self._frame_seq = 0
+
+  def _warn_zed_rectify_once(
+      self, cache_key: tuple[str, int, int], msg: str
+  ) -> None:
+    if cache_key not in self._zed_rectify_warned:
+      self._zed_rectify_warned.add(cache_key)
+      warnings.warn(msg, RuntimeWarning, stacklevel=2)
 
   def _resolve_zed_conf_for_pair(self) -> str:
     sp = self.specs.get("head_stereo")
-    return sp.zed_conf_path if (sp is not None and sp.zed_conf_path) else ""
+    if sp is None:
+      return ""
+    cache_key = (sp.serial, sp.zed_conf_path)
+    if cache_key not in self._zed_conf_fallback_cache:
+      found = resolve_zed_conf_path(
+          serial=sp.serial, explicit_path=sp.zed_conf_path
+      )
+      self._zed_conf_fallback_cache[cache_key] = (
+          str(found) if found is not None else ""
+      )
+    return self._zed_conf_fallback_cache[cache_key]
 
   def _maybe_rectify_zed_pair(
       self, left_rgb: np.ndarray, right_rgb: np.ndarray
   ) -> tuple[np.ndarray, np.ndarray]:
     conf_path = self._resolve_zed_conf_for_pair()
-    if not conf_path or not Path(conf_path).is_file():
+    if not conf_path:
+      self._last_zed_rectification = None
       return left_rgb, right_rgb
-    cv2_mod = require_cv2()
     h, w = int(left_rgb.shape[0]), int(left_rgb.shape[1])
     cache_key = (conf_path, w, h)
     if cache_key not in self._zed_rectify_cache:
-      parsed = parse_zed_conf(conf_path, _zed_res_name_for_size(w, h))
-      k_l = np.asarray(parsed["left"]["K"], dtype=np.float64)
-      d_l = np.asarray(parsed["left"]["dist_coeffs"], dtype=np.float64)
-      k_r = np.asarray(parsed["right"]["K"], dtype=np.float64)
-      d_r = np.asarray(parsed["right"]["dist_coeffs"], dtype=np.float64)
-      st = parsed["stereo"]
-      r_mat, _ = cv2_mod.Rodrigues(
-          np.array([st["rx"], st["cv"], st["rz"]], dtype=np.float64)
-      )
-      t_vec = np.array(
-          [-st["baseline_m"], st["ty_mm"] / 1000.0, st["tz_mm"] / 1000.0],
-          dtype=np.float64,
-      )
-      r1, r2, p1, p2, _, _, _ = cv2_mod.stereoRectify(
-          k_l, d_l, k_r, d_r, (w, h), r_mat, t_vec, alpha=0
-      )
-      self._zed_rectify_cache[cache_key] = (
-          *cv2_mod.initUndistortRectifyMap(
+      if not Path(conf_path).is_file():
+        self._zed_rectify_cache[cache_key] = None
+      elif (w, h) not in _ZED_NATIVE_EYE_SIZES:
+        self._warn_zed_rectify_once(
+            cache_key,
+            f"Skipping ZED stereo rectification for non-native eye size "
+            f"{w}x{h} (supported: {sorted(_ZED_NATIVE_EYE_SIZES)}).",
+        )
+        self._zed_rectify_cache[cache_key] = None
+      else:
+        try:
+          parsed = parse_zed_conf(conf_path, _zed_res_name_for_size(w, h))
+        except (ValueError, configparser.Error, OSError) as exc:
+          self._warn_zed_rectify_once(
+              cache_key,
+              f"Skipping ZED stereo rectification for {w}x{h}: {exc}",
+          )
+          self._zed_rectify_cache[cache_key] = None
+        else:
+          cv2_mod = require_cv2()
+          k_l = np.asarray(parsed.left.K, dtype=np.float64)
+          d_l = np.asarray(parsed.left.dist_coeffs, dtype=np.float64)
+          k_r = np.asarray(parsed.right.K, dtype=np.float64)
+          d_r = np.asarray(parsed.right.dist_coeffs, dtype=np.float64)
+          st = parsed.stereo
+          r_mat, _ = cv2_mod.Rodrigues(
+              np.array([st.rx, st.cv, st.rz], dtype=np.float64)
+          )
+          t_vec = np.array(
+              [-st.baseline_m, st.ty_mm / 1000.0, st.tz_mm / 1000.0],
+              dtype=np.float64,
+          ).reshape(3, 1)
+          r1, r2, p1, p2, _, _, _ = cv2_mod.stereoRectify(
+              k_l, d_l, k_r, d_r, (w, h), r_mat, t_vec, alpha=0
+          )
+          m1_l, m2_l = cv2_mod.initUndistortRectifyMap(
               k_l, d_l, r1, p1, (w, h), cv2_mod.CV_16SC2
-          ),
-          *cv2_mod.initUndistortRectifyMap(
+          )
+          m1_r, m2_r = cv2_mod.initUndistortRectifyMap(
               k_r, d_r, r2, p2, (w, h), cv2_mod.CV_16SC2
-          ),
-      )
+          )
+          self._zed_rectify_cache[cache_key] = ZedRectificationEntry(
+              m1_l=m1_l,
+              m2_l=m2_l,
+              m1_r=m1_r,
+              m2_r=m2_r,
+              r1=np.asarray(r1, dtype=np.float64).copy(),
+              r2=np.asarray(r2, dtype=np.float64).copy(),
+              p1=np.asarray(p1, dtype=np.float64).copy(),
+              p2=np.asarray(p2, dtype=np.float64).copy(),
+              width=w,
+              height=h,
+              conf_path=conf_path,
+          )
 
-    m1_l, m2_l, m1_r, m2_r = self._zed_rectify_cache[cache_key]
+    entry = self._zed_rectify_cache[cache_key]
+    if entry is None:
+      self._last_zed_rectification = None
+      return left_rgb, right_rgb
+
+    cv2_mod = require_cv2()
+    self._last_zed_rectification = entry
     return (
         np.ascontiguousarray(
-            cv2_mod.remap(left_rgb, m1_l, m2_l, cv2_mod.INTER_LINEAR)
+            cv2_mod.remap(
+                left_rgb, entry.m1_l, entry.m2_l, cv2_mod.INTER_LINEAR
+            )
         ),
         np.ascontiguousarray(
-            cv2_mod.remap(right_rgb, m1_r, m2_r, cv2_mod.INTER_LINEAR)
+            cv2_mod.remap(
+                right_rgb, entry.m1_r, entry.m2_r, cv2_mod.INTER_LINEAR
+            )
         ),
     )
+
+  def get_rectified_calibration(self) -> dict[str, CameraCalibration]:
+    """Returns post-rectification intrinsics for ZED head cameras if active."""
+    entry = self._last_zed_rectification
+    if entry is None:
+      return {}
+    p1 = np.asarray(entry.p1, dtype=np.float64)
+    p2 = np.asarray(entry.p2, dtype=np.float64)
+    fx_r = float(p2[0, 0])
+    baseline_m = abs(float(p2[0, 3])) / fx_r if fx_r > 1e-9 else 0.0
+    out: dict[str, CameraCalibration] = {}
+    for cam_name, p_mat, r_mat in (
+        ("head_camera_left", p1, entry.r1),
+        ("head_camera_right", p2, entry.r2),
+    ):
+      k_rect = p_mat[:3, :3].copy()
+      fx = float(k_rect[0, 0])
+      fy = float(k_rect[1, 1])
+      cx = float(k_rect[0, 2])
+      cy = float(k_rect[1, 2])
+      out[cam_name] = CameraCalibration(
+          width=int(entry.width),
+          height=int(entry.height),
+          K=k_rect,
+          intrinsics_tuple=(fx, fy, cx, cy),
+          mp_intrinsics={
+              "focal_px": [fx, fy],
+              "principal_point_px": [cx, cy],
+          },
+          P=p_mat.copy(),
+          R_rect=np.asarray(r_mat, dtype=np.float64).copy(),
+          baseline_m=baseline_m,
+          rectified=True,
+          conf_path=str(entry.conf_path),
+      )
+    return out
 
   def open(self) -> None:
     """Opens configured camera streams."""
@@ -813,20 +1329,24 @@ class Fr3DuoCameraController:
       self._opened = True
       return
 
-    for role, sp in self.specs.items():
-      if role == "head_stereo":
-        cap_w = sp.width if _is_sbs_stereo_spec(sp) else sp.width * 2
-        self._handles[role] = (
-            V4L2Camera(sp, cap_w, sp.height),
-            "v4l2",
-            ("head_camera_left", "head_camera_right"),
-        )
-      else:
-        self._handles[role] = (
-            V4L2Camera(sp, sp.width, sp.height),
-            "v4l2",
-            (role,),
-        )
+    try:
+      for role, sp in self.specs.items():
+        if role == "head_stereo":
+          cap_w = sp.width if _is_sbs_stereo_spec(sp) else sp.width * 2
+          self._handles[role] = (
+              V4L2Camera(sp, cap_w, sp.height),
+              "v4l2",
+              ("head_camera_left", "head_camera_right"),
+          )
+        else:
+          self._handles[role] = (
+              V4L2Camera(sp, sp.width, sp.height),
+              "v4l2",
+              (role,),
+          )
+    except Exception:
+      self.close()
+      raise
 
     self._opened = True
 
@@ -839,6 +1359,7 @@ class Fr3DuoCameraController:
       if callable(close_fn):
         close_fn()
     self._handles.clear()
+    self._last_zed_rectification = None
     self._opened = False
 
   def __enter__(self) -> Fr3DuoCameraController:
@@ -879,6 +1400,7 @@ class Fr3DuoCameraController:
     if not self._opened:
       self.open()
     self._frame_seq += 1
+    self._last_zed_rectification = None
 
     if self.sim_robot is not None:
       ref_spec = (
@@ -894,18 +1416,7 @@ class Fr3DuoCameraController:
       rendered = self.sim_robot.render_sim_cameras(
           width=sim_w, height=int(ref_spec.height)
       )
-      ts = time.monotonic()
-      return {
-          cam_name: CameraFrame(
-              name=cam_name,
-              rgb=np.ascontiguousarray(rendered[cam_name], dtype=np.uint8),
-              timestamp_s=ts,
-              width=int(rendered[cam_name].shape[1]),
-              height=int(rendered[cam_name].shape[0]),
-              backend="mujoco_sim",
-          )
-          for cam_name in CANONICAL_CAMERAS
-      }
+      return build_sim_camera_frames(rendered, time.monotonic())
 
     if self.dry_run and not self._handles:
       ts = time.monotonic()
@@ -947,21 +1458,13 @@ class Fr3DuoCameraController:
           )
         else:
           left_rgb, right_rgb = rgb_raw, rgb_raw.copy()
-        for t_name, view_rgb in ((t_left, left_rgb), (t_right, right_rgb)):
-          oriented = np.ascontiguousarray(view_rgb, dtype=np.uint8)
-          frames[t_name] = CameraFrame(
-              name=t_name,
-              rgb=oriented,
-              timestamp_s=ts,
-              width=int(oriented.shape[1]),
-              height=int(oriented.shape[0]),
-              backend=backend,
-          )
+        views = ((t_left, left_rgb), (t_right, right_rgb))
       else:
-        role = targets[0]
-        oriented = np.ascontiguousarray(rgb_raw, dtype=np.uint8)
-        frames[role] = CameraFrame(
-            name=role,
+        views = ((targets[0], rgb_raw),)
+      for t_name, view_rgb in views:
+        oriented = np.ascontiguousarray(view_rgb, dtype=np.uint8)
+        frames[t_name] = CameraFrame(
+            name=t_name,
             rgb=oriented,
             timestamp_s=ts,
             width=int(oriented.shape[1]),
@@ -976,7 +1479,7 @@ class Fr3DuoCameraController:
       max_age_s: float = 0.30,
       num_reads: int = 3,
       interval_s: float = 0.05,
-  ) -> dict[str, Any]:
+  ) -> CameraFreshnessReport:
     """Verifies frame age (`<= max_age_s`), timestamps, and pixel variance."""
     rounds = max(1, int(num_reads))
     history: dict[str, list[tuple[CameraFrame, float]]] = {}
@@ -999,13 +1502,13 @@ class Fr3DuoCameraController:
         history.setdefault(name, []).append((frame, frame.age_s(now_s)))
 
     errors: list[str] = []
-    cam_reports: dict[str, Any] = {}
+    cam_reports: dict[str, CameraFreshnessEntry] = {}
     if not history:
-      return {
-          "ok": False,
-          "cameras": {},
-          "errors": ["No camera frames captured."],
-      }
+      return CameraFreshnessReport(
+          ok=False,
+          cameras={},
+          errors=["No camera frames captured."],
+      )
 
     has_full_physical_rig = {
         "head_stereo",
@@ -1057,19 +1560,23 @@ class Fr3DuoCameraController:
             f"(mean={mean_val:.2f}, std={std_val:.2f})"
         )
 
-      cam_reports[name] = {
-          "ok": cam_ok,
-          "max_age_s": float(max_observed_age),
-          "timestamps_advancing": ts_advancing,
-          "pixels_changing": pixels_changing,
-          "brightness_mean": mean_val,
-          "pixel_std": std_val,
-          "width": last_frame.width,
-          "height": last_frame.height,
-          "backend": last_frame.backend,
-      }
+      cam_reports[name] = CameraFreshnessEntry(
+          ok=cam_ok,
+          max_age_s=float(max_observed_age),
+          timestamps_advancing=ts_advancing,
+          pixels_changing=pixels_changing,
+          brightness_mean=mean_val,
+          pixel_std=std_val,
+          width=last_frame.width,
+          height=last_frame.height,
+          backend=last_frame.backend,
+      )
 
-    return {"ok": len(errors) == 0, "cameras": cam_reports, "errors": errors}
+    return CameraFreshnessReport(
+        ok=len(errors) == 0,
+        cameras=cam_reports,
+        errors=errors,
+    )
 
 
 def render_contact_sheet(
@@ -1113,7 +1620,7 @@ def render_contact_sheet(
       label = f"{cam_name} {width}x{height} {backend}".strip()
 
     banner_h = min(tile_h, 26)
-    tile[:banner_h] = (tile[:banner_h].astype(np.uint16) // 4).astype(np.uint8)
+    tile[:banner_h] //= 4
     cv2_mod.putText(
         tile,
         label,

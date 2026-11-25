@@ -45,7 +45,7 @@ import robotiq_gripper_controller
 DEFAULT_CONFIG_PATH = "config/robot_config.json"
 MIN_INTER_ARM_CLEARANCE_M = 0.030
 BASE_WORLD_Z_M = 0.163887
-BRACKET_UNDERSIDE_FRONT_X_M = 0.08437
+BRACKET_UNDERSIDE_FRONT_X_M = fr3_mjcf.BRACKET_UNDERSIDE_FRONT_X_M
 
 
 @dataclass
@@ -141,7 +141,6 @@ class RobotConfig:
   min_inter_arm_clearance_m: float = MIN_INTER_ARM_CLEARANCE_M
   tcp_offset_z_m: float = 0.145
   realtime_mode: str = "auto"
-  zed_settings_dir: str = ""
   max_joint_speed_deg_s: float | None = None
   arms: ArmsConfig = field(default_factory=ArmsConfig)
   cameras: CamerasConfig = field(default_factory=CamerasConfig)
@@ -199,18 +198,8 @@ def _overlay_arm_config(arm: ArmConfig, raw: Mapping[str, Any]) -> None:
 def _overlay_camera_spec(
     base: fr3_camera_controller.CameraStreamSpec, raw: Mapping[str, Any]
 ) -> fr3_camera_controller.CameraStreamSpec:
-  merged = {
-      "role": base.role,
-      "serial": base.serial,
-      "device_path": base.device_path,
-      "width": base.width,
-      "height": base.height,
-      "fps": base.fps,
-      "zed_conf_path": base.zed_conf_path,
-  }
-  for key, val in raw.items():
-    if val is not None:
-      merged[key] = val
+  merged = asdict(base)
+  merged.update({k: v for k, v in raw.items() if v is not None})
   return fr3_camera_controller.CameraStreamSpec.from_mapping(
       base.role, merged
   )
@@ -236,28 +225,21 @@ def normalize_robot_config(
   raw = dict(updates) if isinstance(updates, Mapping) else {}
   cfg = default_robot_config()
 
-  for str_key in (
-      "platform",
-      "realtime_mode",
-      "zed_settings_dir",
+  for key, cast in (
+      ("platform", str),
+      ("realtime_mode", str),
+      ("base_height_m", float),
+      ("table_height_m", float),
+      ("table_front_offset_m", float),
+      ("table_width_m", float),
+      ("table_depth_m", float),
+      ("min_inter_arm_clearance_m", float),
+      ("tcp_offset_z_m", float),
+      ("geometry_confirmed", bool),
+      ("max_joint_speed_deg_s", float),
   ):
-    if str_key in raw and raw[str_key] is not None:
-      setattr(cfg, str_key, str(raw[str_key]))
-
-  for float_key in (
-      "base_height_m",
-      "table_height_m",
-      "table_front_offset_m",
-      "table_width_m",
-      "table_depth_m",
-      "min_inter_arm_clearance_m",
-      "tcp_offset_z_m",
-  ):
-    if float_key in raw and raw[float_key] is not None:
-      setattr(cfg, float_key, float(raw[float_key]))
-
-  if "geometry_confirmed" in raw and raw["geometry_confirmed"] is not None:
-    cfg.geometry_confirmed = bool(raw["geometry_confirmed"])
+    if raw.get(key) is not None:
+      setattr(cfg, key, cast(raw[key]))
 
   has_raw_heights = (
       raw.get("base_height_m") is not None
@@ -267,9 +249,6 @@ def normalize_robot_config(
     cfg.base_height_m = round(
         BASE_WORLD_Z_M + float(cfg.table_height_m) - float(raw["z_table_m"]), 6
     )
-
-  if raw.get("max_joint_speed_deg_s") is not None:
-    cfg.max_joint_speed_deg_s = float(raw["max_joint_speed_deg_s"])
 
   raw_arms = raw.get("arms")
   if isinstance(raw_arms, Mapping):
@@ -306,11 +285,8 @@ def table_box_bounds(
   return cfg.table_box_bounds()
 
 
-def _is_camera_bound(cam: Any) -> bool:
-  return bool(
-      str(getattr(cam, "device_path", "") or "").strip()
-      or str(getattr(cam, "serial", "") or "").strip()
-  )
+def _is_camera_bound(cam: fr3_camera_controller.CameraStreamSpec) -> bool:
+  return bool((cam.device_path or "").strip() or (cam.serial or "").strip())
 
 
 def _is_valid_geom_number(value: Any, *, allow_zero: bool) -> bool:
@@ -466,34 +442,22 @@ def resolve_realtime_config(
       detect_preempt_rt() if is_preempt_rt is None else bool(is_preempt_rt)
   )
 
+  if normalized == "enforce" and not rt_active:
+    raise RuntimeError(
+        "PREEMPT_RT kernel is required for `--realtime enforce`, but the "
+        "current kernel is not real-time patched. Boot a PREEMPT_RT kernel "
+        "or pass `--realtime auto`."
+    )
   if normalized == "enforce":
-    if not rt_active:
-      raise RuntimeError(
-          "PREEMPT_RT kernel is required for `--realtime enforce`, but the "
-          "current kernel is not real-time patched. Boot a PREEMPT_RT kernel "
-          "or pass `--realtime auto`."
-      )
-    return {
-        "mode": "enforce",
-        "is_preempt_rt": True,
-        "realtime_config": "kEnforce",
-        "max_joint_speed_deg_s": 45.0,
-        "max_joint_acc_rad_s2": 5.0,
-    }
-
-  if normalized == "auto" and rt_active:
-    return {
-        "mode": "auto",
-        "is_preempt_rt": True,
-        "realtime_config": "kEnforce",
-        "max_joint_speed_deg_s": 30.0,
-        "max_joint_acc_rad_s2": 3.5,
-    }
-
+    rt_cfg, max_speed, max_acc = "kEnforce", 45.0, 5.0
+  elif normalized == "auto" and rt_active:
+    rt_cfg, max_speed, max_acc = "kEnforce", 30.0, 3.5
+  else:
+    rt_cfg, max_speed, max_acc = "kIgnore", 15.0, 2.0
   return {
       "mode": normalized,
       "is_preempt_rt": rt_active,
-      "realtime_config": "kIgnore",
-      "max_joint_speed_deg_s": 15.0,
-      "max_joint_acc_rad_s2": 2.0,
+      "realtime_config": rt_cfg,
+      "max_joint_speed_deg_s": max_speed,
+      "max_joint_acc_rad_s2": max_acc,
   }

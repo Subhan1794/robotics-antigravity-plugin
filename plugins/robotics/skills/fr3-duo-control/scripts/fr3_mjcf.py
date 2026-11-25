@@ -30,6 +30,7 @@ from collections.abc import Mapping
 import copy
 import dataclasses
 import fcntl
+import functools
 import json
 import math
 import os
@@ -64,13 +65,6 @@ FR3_IK_MARGINS_RAD = (0.025, 0.025, 0.025, 0.100, 0.025, 0.025, 0.025)
 
 WRIST_CAMERA_POS_LINK7 = (0.0639045, 0.0, 0.173407)
 WRIST_CAMERA_QUAT_LINK7_WXYZ = (0.122788, 0.696364, 0.696364, 0.122788)
-WRIST_CAMERA_RESOLUTION = "1280 720"
-WRIST_CAMERA_SENSORSIZE = "0.00193 0.00193"
-WRIST_CAMERA_FOCALPIXEL = "635 635"
-
-HEAD_CAMERA_RESOLUTION = "1280 720"
-HEAD_CAMERA_SENSORSIZE = "0.00512 0.00288"
-HEAD_CAMERA_FOCALPIXEL = "710 710"
 
 SPINE_TABLETOP_POS_XYZ = (-0.244844, 0.0, -0.75)
 BRACKET_UNDERSIDE_FRONT_X_M = 0.08437
@@ -207,7 +201,8 @@ def _sparse_checkout_menagerie(target_dir: Path) -> Path:
     target = str(target_dir)
     sparse_cfg = target_dir / ".git" / "info" / "sparse-checkout"
     try:
-      if not sparse_cfg.exists():
+      fresh_clone = not sparse_cfg.exists()
+      if fresh_clone:
         if target_dir.exists():
           shutil.rmtree(target_dir)
         subprocess.run(
@@ -221,41 +216,23 @@ def _sparse_checkout_menagerie(target_dir: Path) -> Path:
             ],
             check=True,
         )
-        subprocess.run(
-            [
-                "git",
-                "-C",
-                target,
-                "sparse-checkout",
-                "set",
-                *_MENAGERIE_SPARSE_PATHS,
-            ],
-            check=True,
-        )
-        subprocess.run(["git", "-C", target, "checkout"], check=True)
-      else:
-        subprocess.run(
-            [
-                "git",
-                "-C",
-                target,
-                "sparse-checkout",
-                "set",
-                *_MENAGERIE_SPARSE_PATHS,
-            ],
-            check=True,
-        )
-        subprocess.run(
-            [
-                "git",
-                "-C",
-                target,
-                "checkout",
-                "--",
-                *_MENAGERIE_SPARSE_PATHS,
-            ],
-            check=True,
-        )
+      subprocess.run(
+          [
+              "git",
+              "-C",
+              target,
+              "sparse-checkout",
+              "set",
+              *_MENAGERIE_SPARSE_PATHS,
+          ],
+          check=True,
+      )
+      checkout_cmd = (
+          ["git", "-C", target, "checkout"]
+          if fresh_clone
+          else ["git", "-C", target, "checkout", "--", *_MENAGERIE_SPARSE_PATHS]
+      )
+      subprocess.run(checkout_cmd, check=True)
     except (OSError, subprocess.SubprocessError) as exc:
       raise FileNotFoundError(
           f"Failed to sparse-clone mujoco_menagerie into {target_dir}: {exc}"
@@ -269,16 +246,17 @@ def _sparse_checkout_menagerie(target_dir: Path) -> Path:
     return target_dir
 
 
-def find_menagerie_dir(
-    explicit_path: str | Path | None = None,
-) -> Path | None:
-  """Resolves `mujoco_menagerie` with `franka_fr3_duo` & `robotiq_2f85`."""
-  if explicit_path is not None:
-    raw = str(explicit_path).strip()
-    if not raw:
-      return None
-    cand = _lexical_abspath(raw)
-    return cand if _is_valid_menagerie_dir(cand) else None
+def _resolve_menagerie_dir(menagerie_dir: str | Path | None = None) -> Path:
+  """Resolves `mujoco_menagerie` or raises `FileNotFoundError`."""
+  if menagerie_dir is not None:
+    raw = str(menagerie_dir).strip()
+    cand = _lexical_abspath(raw) if raw else None
+    if cand is None or not _is_valid_menagerie_dir(cand):
+      raise FileNotFoundError(
+          "mujoco_menagerie `franka_fr3_duo` assets not found "
+          f"(menagerie_dir={menagerie_dir!r})."
+      )
+    return cand
 
   runfiles_dir = _find_runfiles_menagerie_dir()
   if runfiles_dir is not None:
@@ -287,37 +265,24 @@ def find_menagerie_dir(
   cache_dir = _menagerie_cache_dir()
   if _is_valid_menagerie_dir(cache_dir):
     return cache_dir
+  return _sparse_checkout_menagerie(cache_dir)
 
+
+def find_menagerie_dir(
+    explicit_path: str | Path | None = None,
+) -> Path | None:
+  """Resolves `mujoco_menagerie` with `franka_fr3_duo` & `robotiq_2f85`."""
   try:
-    return _sparse_checkout_menagerie(cache_dir)
+    return _resolve_menagerie_dir(explicit_path)
   except (OSError, subprocess.SubprocessError):
-    # Return None so callers outside try/except can inspect status or retry.
     return None
-
-
-def _resolve_menagerie_dir(menagerie_dir: str | Path | None = None) -> Path:
-  """Resolves `mujoco_menagerie` or raises `FileNotFoundError`."""
-  if menagerie_dir is not None:
-    resolved = find_menagerie_dir(menagerie_dir)
-    if resolved is None:
-      raise FileNotFoundError(
-          "mujoco_menagerie `franka_fr3_duo` assets not found "
-          f"(menagerie_dir={menagerie_dir!r})."
-      )
-    return resolved
-
-  runfiles_dir = _find_runfiles_menagerie_dir()
-  if runfiles_dir is not None:
-    return runfiles_dir
-
-  return _sparse_checkout_menagerie(_menagerie_cache_dir())
 
 
 def _coerce_config_mapping(config: Any) -> dict[str, Any]:
   if config is None:
     return {}
   if dataclasses.is_dataclass(config) and not isinstance(config, type):
-    return dataclasses.asdict(config)
+    return {f.name: getattr(config, f.name) for f in dataclasses.fields(config)}
   if isinstance(config, Mapping):
     return dict(config)
   raise TypeError(f"Unsupported config type: {type(config)!r}")
@@ -416,6 +381,13 @@ def _add_cameras(spec: Any) -> None:
       )
 
 
+def _cfg_float(
+    config: Mapping[str, Any], key: str, default: float
+) -> float:
+  raw = config.get(key)
+  return float(raw) if raw is not None else default
+
+
 def _resolve_table_geometry(
     config: Mapping[str, Any],
 ) -> tuple[float, float, float, float]:
@@ -424,22 +396,17 @@ def _resolve_table_geometry(
       config.get("base_height_m") is not None
       or config.get("table_height_m") is not None
   ):
-    raw_base = config.get("base_height_m")
-    raw_table = config.get("table_height_m")
-    base_h = float(raw_base) if raw_base is not None else 0.913887
-    table_h = float(raw_table) if raw_table is not None else 0.75
+    base_h = _cfg_float(config, "base_height_m", 0.913887)
+    table_h = _cfg_float(config, "table_height_m", 0.75)
     z_table_m = round(0.163887 - (base_h - table_h), 6)
-  elif config.get("z_table_m") is not None:
-    z_table_m = float(config["z_table_m"])
   else:
-    z_table_m = 0.0
-  raw_offset = config.get("table_front_offset_m")
-  raw_width = config.get("table_width_m")
-  raw_depth = config.get("table_depth_m")
-  front_offset = float(raw_offset) if raw_offset is not None else 0.25
-  width = float(raw_width) if raw_width is not None else 1.22
-  depth = float(raw_depth) if raw_depth is not None else 0.74
-  return z_table_m, front_offset, width, depth
+    z_table_m = _cfg_float(config, "z_table_m", 0.0)
+  return (
+      z_table_m,
+      _cfg_float(config, "table_front_offset_m", 0.25),
+      _cfg_float(config, "table_width_m", 1.22),
+      _cfg_float(config, "table_depth_m", 0.74),
+  )
 
 
 def _add_arena_props(spec: Any, config: Mapping[str, Any]) -> None:
@@ -494,9 +461,6 @@ def _require_mujoco() -> Any:
   return mujoco
 
 
-_ADDITIVE_MARGIN_GAP_LOCK = threading.Lock()
-_ADDITIVE_MARGIN_GAP_CACHE: bool | None = None
-
 _MJCF_BUILD_CACHE_LOCK = threading.Lock()
 _MJCF_BUILD_CACHE: collections.OrderedDict[tuple[Any, ...], tuple[Any, str]] = (
     collections.OrderedDict()
@@ -504,51 +468,49 @@ _MJCF_BUILD_CACHE: collections.OrderedDict[tuple[Any, ...], tuple[Any, str]] = (
 _MJCF_BUILD_CACHE_MAX = 16
 
 
+@functools.lru_cache(maxsize=None)
+def _probe_sphere_contact(pos_x: float, margin: float, gap: float) -> bool:
+  mj = _require_mujoco()
+  geom = (
+      f'<geom type="sphere" size="0.01" margin="{margin}" gap="{gap}" '
+      'contype="1" conaffinity="1"/>'
+  )
+  probe_xml = (
+      '<mujoco model="margin_probe"><worldbody>'
+      f'<body name="b1" pos="0 0 0">{geom}</body>'
+      f'<body name="b2" pos="{pos_x} 0 0"><freejoint/>{geom}</body>'
+      "</worldbody></mujoco>"
+  )
+  m = mj.MjModel.from_xml_string(probe_xml)
+  d = mj.MjData(m)
+  mj.mj_kinematics(m, d)
+  mj.mj_collision(m, d)
+  return int(d.ncon) > 0
+
+
 def uses_additive_margin_gap() -> bool:
   """Returns True on MuJoCo >= 3.9 where detection uses `margin + gap`."""
-  global _ADDITIVE_MARGIN_GAP_CACHE
-  cached = _ADDITIVE_MARGIN_GAP_CACHE
-  if cached is not None:
-    return cached
-  with _ADDITIVE_MARGIN_GAP_LOCK:
-    if _ADDITIVE_MARGIN_GAP_CACHE is not None:
-      return _ADDITIVE_MARGIN_GAP_CACHE
-    mj = _require_mujoco()
-    probe_xml = (
-        '<mujoco model="margin_gap_probe">'
-        "<worldbody>"
-        '<body name="b1" pos="0 0 0">'
-        '<geom type="sphere" size="0.01" margin="0" gap="0.02" '
-        'contype="1" conaffinity="1"/>'
-        "</body>"
-        '<body name="b2" pos="0.03 0 0">'
-        "<freejoint/>"
-        '<geom type="sphere" size="0.01" margin="0" gap="0.02" '
-        'contype="1" conaffinity="1"/>'
-        "</body>"
-        "</worldbody>"
-        "</mujoco>"
-    )
-    m = mj.MjModel.from_xml_string(probe_xml)
-    d = mj.MjData(m)
-    mj.mj_kinematics(m, d)
-    mj.mj_collision(m, d)
-    _ADDITIVE_MARGIN_GAP_CACHE = int(d.ncon) > 0
-    return _ADDITIVE_MARGIN_GAP_CACHE
+  return _probe_sphere_contact(0.03, 0.0, 0.02)
 
 
 def resolve_min_inter_arm_clearance(config: Any) -> float:
   """Extracts non-negative `min_inter_arm_clearance_m` from `config`."""
   cfg = _coerce_config_mapping(config)
-  return max(0.0, float(cfg.get("min_inter_arm_clearance_m", 0.030)))
+  return max(0.0, _cfg_float(cfg, "min_inter_arm_clearance_m", 0.030))
+
+
+def uses_pairwise_additive_margin() -> bool:
+  """Returns True on MuJoCo >= 3.5 where pairwise margin/gap is summed."""
+  return _probe_sphere_contact(0.045, 0.015, 0.0)
 
 
 def _apply_inter_arm_clearance_margins(
     spec: Any, min_clearance_m: float
 ) -> None:
-  """Applies half-clearance `gap` (and legacy `margin`) to arm geoms."""
-  half_clearance = max(0.0, 0.5 * float(min_clearance_m))
-  if half_clearance <= 0.0:
+  """Applies clearance `gap` (and legacy `margin`) to arm geoms."""
+  scale = 0.5 if uses_pairwise_additive_margin() else 1.0
+  clearance = max(0.0, scale * float(min_clearance_m))
+  if clearance <= 0.0:
     return
   additive_mode = uses_additive_margin_gap()
   for geom in spec.geoms:
@@ -558,21 +520,20 @@ def _apply_inter_arm_clearance_margins(
     bname = str(parent.name) if parent is not None else ""
     if not bname.startswith(("left/", "right/")):
       continue
-    geom.gap = max(float(geom.gap), half_clearance)
+    geom.gap = max(float(geom.gap), clearance)
     if not additive_mode:
-      geom.margin = max(float(geom.margin), half_clearance)
+      geom.margin = max(float(geom.margin), clearance)
 
 
 def _mjcf_cache_payload(config: Mapping[str, Any]) -> dict[str, Any]:
   z_table_m, front_offset, width, depth = _resolve_table_geometry(config)
-  raw_tcp = config.get("tcp_offset_z_m")
   return {
       "z_table_m": z_table_m,
       "table_front_offset_m": front_offset,
       "table_width_m": width,
       "table_depth_m": depth,
       "min_inter_arm_clearance_m": resolve_min_inter_arm_clearance(config),
-      "tcp_offset_z_m": float(raw_tcp) if raw_tcp is not None else 0.145,
+      "tcp_offset_z_m": _cfg_float(config, "tcp_offset_z_m", 0.145),
   }
 
 
@@ -640,9 +601,7 @@ def _assemble_duo_spec(
   if pinch is None:
     raise ValueError("Gripper site not found: pinch")
   pinch.name = "pinch_site"
-  raw_tcp = cfg.get("tcp_offset_z_m")
-  tcp_offset_z_m = float(raw_tcp) if raw_tcp is not None else 0.145
-  pinch.pos = [0.0, 0.0, tcp_offset_z_m]
+  pinch.pos = [0.0, 0.0, _cfg_float(cfg, "tcp_offset_z_m", 0.145)]
 
   for side in ("left", "right"):
     prefix = gripper_prefix(side)
@@ -657,6 +616,15 @@ def _assemble_duo_spec(
     spec.add_exclude(bodyname1=link7, bodyname2=f"{prefix}base_mount")
     spec.add_exclude(bodyname1=link7, bodyname2=f"{prefix}base")
     spec.add_exclude(bodyname1=link6, bodyname2=f"{prefix}base_mount")
+
+    for j_idx in range(7):
+      jnt = spec.joint(f"{side}/fr3_joint{j_idx + 1}")
+      if jnt is not None:
+        lo, hi = FR3_JOINT_LIMITS_RAD[j_idx]
+        jnt.range = [
+            max(float(jnt.range[0]), float(lo)),
+            min(float(jnt.range[1]), float(hi)),
+        ]
 
   spec.add_exclude(bodyname1="left/fr3_link0", bodyname2="right/fr3_link0")
   _add_cameras(spec)

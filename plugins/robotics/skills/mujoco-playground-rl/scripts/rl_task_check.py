@@ -235,6 +235,14 @@ def _sample_random_action(action_spec: Any, nworld: int, device: str) -> Any:
   )
 
 
+def _configure_runtime_env(platform: str | None = None) -> str | None:
+  """Configures platform-safe MUJOCO_GL and returns optional Warp cache dir."""
+  active_platform = sys.platform if platform is None else platform
+  if active_platform.startswith("linux"):
+    os.environ.setdefault("MUJOCO_GL", "egl")
+  return os.environ.get("WP_KERNEL_CACHE_DIR") or None
+
+
 def smoke_test_env(
     env_id: str,
     *,
@@ -249,16 +257,16 @@ def smoke_test_env(
     if root_str not in sys.path:
       sys.path.insert(0, root_str)
 
+  cache_dir = _configure_runtime_env()
+
   import torch
   import warp as wp
   from mujoco_playground._src.rl import env_registry
   from reaf.simulation import torch as reaf_sim
   from reaf.simulation.torch import flat_scene
 
-  os.environ.setdefault("MUJOCO_GL", "osmesa")
-  wp.config.kernel_cache_dir = os.environ.get(
-      "WP_KERNEL_CACHE_DIR", "/tmp/wp_kernel_cache"
-  )
+  if cache_dir:
+    wp.config.kernel_cache_dir = cache_dir
 
   entry = env_registry.get(env_id)
   actor_groups = tuple(entry.runner_cfg.obs_groups["actor"])

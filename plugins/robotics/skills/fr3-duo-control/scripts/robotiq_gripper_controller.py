@@ -24,6 +24,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 import glob
+import math
 import os
 from pathlib import Path
 import struct
@@ -43,7 +44,6 @@ EMPTY_CLOSE_MIN_RATIO = 0.80
 
 ACTION_REG_START = 0x03E8
 STATUS_REG_START = 0x07D0
-OBJECT_GRASP_MAX_RATIO = EMPTY_CLOSE_MIN_RATIO
 
 
 def crc16_modbus(data: bytes) -> int:
@@ -61,7 +61,10 @@ def crc16_modbus(data: bytes) -> int:
 
 def closure_to_raw(closure_0_to_1: float) -> int:
   """Maps normalized closure in [0.0, 1.0] (0=open, 1=closed) to [0, 255]."""
-  clamped = max(0.0, min(1.0, float(closure_0_to_1)))
+  val = float(closure_0_to_1)
+  if not math.isfinite(val):
+    raise ValueError(f"closure_0_to_1 must be finite, got {closure_0_to_1!r}")
+  clamped = max(0.0, min(1.0, val))
   return int(round(clamped * 255.0))
 
 
@@ -119,6 +122,26 @@ def _read_sysfs_text(path: Path) -> str:
     return ""
 
 
+def _read_sysfs_int(path: Path) -> int | None:
+  if not path.is_file():
+    return None
+  try:
+    return int(_read_sysfs_text(path))
+  except ValueError:
+    return None
+
+
+def _side_hint_from_name(name: str, *, require_robotiq: bool = False) -> str:
+  lower = name.lower()
+  if require_robotiq and "robotiq" not in lower:
+    return ""
+  if "left" in lower:
+    return "left"
+  if "right" in lower:
+    return "right"
+  return ""
+
+
 def _inspect_tty_sysfs(
     resolved_tty_path: str, *, sys_tty_root: Path = Path("/sys/class/tty")
 ) -> dict[str, Any]:
@@ -146,13 +169,10 @@ def _inspect_tty_sysfs(
       dev_dir / "latency_timer",
       sys_tty_root / tty_name / "latency_timer",
   ):
-    if lat_cand.is_file():
-      try:
-        info["latency_timer_ms"] = int(_read_sysfs_text(lat_cand))
-        break
-      except ValueError:
-        # Ignore non-integer sysfs latency_timer content.
-        pass
+    lat_val = _read_sysfs_int(lat_cand)
+    if lat_val is not None:
+      info["latency_timer_ms"] = lat_val
+      break
 
   cur: Path | None = None
   try:
@@ -180,14 +200,8 @@ def _inspect_tty_sysfs(
           info["serial"] = raw_ser
       if not info["product"] and (cur / "product").is_file():
         info["product"] = _read_sysfs_text(cur / "product")
-      if info["latency_timer_ms"] is None and (cur / "latency_timer").is_file():
-        try:
-          info["latency_timer_ms"] = int(
-              _read_sysfs_text(cur / "latency_timer")
-          )
-        except ValueError:
-          # Ignore non-integer sysfs latency_timer content.
-          pass
+      if info["latency_timer_ms"] is None:
+        info["latency_timer_ms"] = _read_sysfs_int(cur / "latency_timer")
       if found_usb_dev or cur.parent == cur:
         break
       cur = cur.parent
@@ -225,7 +239,6 @@ def resolve_serial_ports(
     dev_patterns: Sequence[str] = (
         "/dev/ttyUSB*",
         "/dev/ttyACM*",
-        "/dev/cu.usbserial*",
     ),
     sys_tty_root: Path = Path("/sys/class/tty"),
 ) -> list[dict[str, Any]]:
@@ -239,18 +252,12 @@ def resolve_serial_ports(
         resolved = os.path.realpath(str(p))
       except OSError:
         continue
-      name_lower = p.name.lower()
-      side_hint = ""
-      if "left" in name_lower:
-        side_hint = "left"
-      elif "right" in name_lower:
-        side_hint = "right"
       entries_by_resolved[resolved] = {
           "path": str(p),
           "resolved_path": resolved,
           "name": p.name,
           "source": "udev_symlink",
-          "side_hint": side_hint,
+          "side_hint": _side_hint_from_name(p.name),
       }
 
   if by_id_dir.is_dir():
@@ -264,19 +271,12 @@ def resolve_serial_ports(
           and entries_by_resolved[resolved]["source"] == "udev_symlink"
       ):
         continue
-      name_lower = entry.name.lower()
-      side_hint = ""
-      if "robotiq" in name_lower:
-        if "left" in name_lower:
-          side_hint = "left"
-        elif "right" in name_lower:
-          side_hint = "right"
       entries_by_resolved[resolved] = {
           "path": str(entry),
           "resolved_path": resolved,
           "name": entry.name,
           "source": "by-id",
-          "side_hint": side_hint,
+          "side_hint": _side_hint_from_name(entry.name, require_robotiq=True),
       }
 
   for pattern in dev_patterns:
@@ -342,8 +342,9 @@ def select_gripper_ports(
 ) -> dict[str, Any]:
   """Selects active gripper ports, warns on mismatches, and adds advisories."""
   configured = configured_ports or {}
-  left = str(configured.get("left", "") or "")
-  right = str(configured.get("right", "") or "")
+  chosen = {
+      side: str(configured.get(side, "") or "") for side in ("left", "right")
+  }
   robotiq_candidates = [
       p["path"]
       for p in serial_ports
@@ -357,7 +358,7 @@ def select_gripper_ports(
   warnings: list[str] = []
   advisories: list[str] = []
 
-  for side, cfg_path in (("left", left), ("right", right)):
+  for side, cfg_path in chosen.items():
     if cfg_path:
       resolved_cfg = os.path.realpath(cfg_path)
       matched_sp = next(
@@ -379,33 +380,24 @@ def select_gripper_ports(
             "(0403:6015)."
         )
 
-  if not left:
-    left_cands = [
-        p["path"]
-        for p in serial_ports
-        if p.get("device_role_hint") == "robotiq_rs485"
-        and p.get("side_hint") == "left"
-    ]
-    if len(left_cands) == 1:
-      left = left_cands[0]
+  for side in ("left", "right"):
+    if not chosen[side]:
+      side_cands = [
+          p["path"]
+          for p in serial_ports
+          if p.get("device_role_hint") == "robotiq_rs485"
+          and p.get("side_hint") == side
+      ]
+      if len(side_cands) == 1:
+        chosen[side] = side_cands[0]
 
-  if not right:
-    right_cands = [
-        p["path"]
-        for p in serial_ports
-        if p.get("device_role_hint") == "robotiq_rs485"
-        and p.get("side_hint") == "right"
-    ]
-    if len(right_cands) == 1:
-      right = right_cands[0]
-
-  if not left or not right:
+  if not chosen["left"] or not chosen["right"]:
     fallback_roles = (
         ("robotiq_rs485",)
         if robotiq_candidates
         else ("robotiq_rs485", "ftdi_serial")
     )
-    used_paths = {p for p in (left, right) if p}
+    used_paths = {p for p in chosen.values() if p}
     used_resolved = {os.path.realpath(p) for p in used_paths}
     unassigned = [
         p
@@ -422,18 +414,13 @@ def select_gripper_ports(
         )
     )
     auto_assigned: list[str] = []
-    if not left and unassigned:
-      chosen_l = unassigned.pop(0)
-      left = str(chosen_l["path"])
-      auto_assigned.append(
-          f"left={left} (serial={chosen_l.get('serial') or 'n/a'})"
-      )
-    if not right and unassigned:
-      chosen_r = unassigned.pop(0)
-      right = str(chosen_r["path"])
-      auto_assigned.append(
-          f"right={right} (serial={chosen_r.get('serial') or 'n/a'})"
-      )
+    for side in ("left", "right"):
+      if not chosen[side] and unassigned:
+        entry = unassigned.pop(0)
+        chosen[side] = str(entry["path"])
+        auto_assigned.append(
+            f"{side}={chosen[side]} (serial={entry.get('serial') or 'n/a'})"
+        )
     if auto_assigned:
       advisories.append(
           "Auto-assigned Robotiq RS-485 gripper port(s) without udev "
@@ -443,6 +430,7 @@ def select_gripper_ports(
           "/dev/robotiq_gripper_{left,right} udev symlinks."
       )
 
+  left, right = chosen["left"], chosen["right"]
   if (not left or not right) and robotiq_candidates and ignored_teleop_ports:
     advisories.append(
         f"Detected teleop / FT232H serial port(s) {ignored_teleop_ports} "
@@ -491,6 +479,11 @@ class RobotiqStatus:
   current_ma: float
 
   @property
+  def gOBJ(self) -> int:
+    """Modbus `gOBJ` alias for `obj_status` (0=moving, 1=open, 2=close)."""
+    return self.obj_status
+
+  @property
   def position_ratio(self) -> float:
     """Measured closure ratio in [0.0, 1.0] (0.0 = open, 1.0 = closed)."""
     return max(0.0, min(1.0, float(self.measured_pos_raw) / 255.0))
@@ -499,7 +492,7 @@ class RobotiqStatus:
   def is_object_grasped(self) -> bool:
     """True when jaws stalled on an object during closing before full stroke."""
     return bool(
-        self.obj_status == 2 and self.position_ratio < OBJECT_GRASP_MAX_RATIO
+        self.obj_status == 2 and self.position_ratio < EMPTY_CLOSE_MIN_RATIO
     )
 
   @property
@@ -542,6 +535,7 @@ class RobotiqStatus:
         "activated": self.activated,
         "goto_active": self.goto_active,
         "obj_status": self.obj_status,
+        "gOBJ": self.obj_status,
         "fault": self.fault,
         "requested_pos_raw": self.requested_pos_raw,
         "measured_pos_raw": self.measured_pos_raw,
@@ -687,13 +681,16 @@ class RobotiqGripper:
       )
     return response
 
+  def _require_live_connection(self, action: str) -> None:
+    if self.dry_run:
+      raise RuntimeError(f"Robotiq {action} is blocked in dry_run mode.")
+    if self._serial is None:
+      self.connect()
+
   def _write_action_registers(
       self, reg0: int, reg1: int, reg2: int
   ) -> None:
-    if self.dry_run:
-      raise RuntimeError("Robotiq actuation is blocked in dry_run mode.")
-    if self._serial is None:
-      self.connect()
+    self._require_live_connection("actuation")
     frame = build_write_registers_frame(
         self.slave_id, ACTION_REG_START, (reg0, reg1, reg2)
     )
@@ -724,7 +721,7 @@ class RobotiqGripper:
     )
     with self._lock:
       resp = self._transact_unlocked(frame, expected_len=11)
-    if resp[1] not in (0x04, 0x03):
+    if resp[1] != 0x04:
       raise RuntimeError(
           f"Unexpected Modbus read function code {resp[1]:#x} (expected 0x04)"
       )
@@ -738,10 +735,7 @@ class RobotiqGripper:
       self, *, reset_first: bool = False, timeout_s: float = 3.0
   ) -> RobotiqStatus:
     """Activates the Robotiq gripper (triggers jaw calibration if needed)."""
-    if self.dry_run:
-      raise RuntimeError("Robotiq activation is blocked in dry_run mode.")
-    if self._serial is None:
-      self.connect()
+    self._require_live_connection("activation")
 
     if reset_first:
       self._write_action_registers(0x0000, 0x0000, 0x0000)
@@ -772,10 +766,7 @@ class RobotiqGripper:
       timeout_s: float = 1.5,
   ) -> RobotiqStatus:
     """Commands normalized jaw closure in [0.0, 1.0] (0.0=open, 1.0=closed)."""
-    if self.dry_run:
-      raise RuntimeError("Robotiq actuation is blocked in dry_run mode.")
-    if self._serial is None:
-      self.connect()
+    self._require_live_connection("actuation")
 
     pre_status = self.read_status()
     if not pre_status.activated:

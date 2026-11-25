@@ -34,10 +34,12 @@ from fr3_duo_robot import Fr3DuoRobot
 
 cfg = load_robot_config("config/robot_config.json")
 with Fr3DuoRobot(cfg, mode="sim") as robot:
-  state = robot.read_state()
-  frames = robot.render_sim_cameras(width=1280, height=720)
+  obs = robot.observe_scene()  # returns SceneObservation (dict-compatible)
+  state, frames = obs.state, obs.frames  # or read_state() + render_sim_cameras(width=1280, height=720)
   robot.activate_grippers()
-  robot.move_arm_waypoints("left", [state["left"]["q_rad"], q_target])
+  robot.move_arm_waypoints("left", [state.left.q_rad, q_target])  # returns MotionResult
+  contact = robot.move_cartesian_until_contact("left", direction=(0.0, 0.0, -1.0), max_distance_m=0.03)  # returns ContactMoveResult
+  robot.home("both")  # returns MotionResult; pass read_only=True in __init__ to block all actuation while capturing live HW state/cameras
 ```
 
 1. **Compose scene automatically:** `Fr3DuoRobot(cfg, mode="sim")` calls
@@ -53,7 +55,7 @@ with Fr3DuoRobot(cfg, mode="sim") as robot:
    `cfg.table_box_bounds()`), with pinch site offset `cfg.tcp_offset_z_m`
    (`0.145 m` stock 2F-85 vs `0.185 m` extended).
 2. **Headless camera rendering:** Set `MUJOCO_GL=osmesa` (or `egl`) on headless
-   Linux when calling `render_sim_cameras(...)`.
+   Linux when calling `observe_scene(...)` or `render_sim_cameras(...)`.
 3. **Dynamic object-manipulation sims (`<freejoint/>` props):**
    * Build your scene from `spec = build_fr3_duo_spec(cfg, include_arena=True,
      add_gravcomp=False)` (or `add_gravcomp=True` for Studio gravity-compensated
@@ -70,6 +72,15 @@ with Fr3DuoRobot(cfg, mode="sim") as robot:
 4. **Keep sim-to-real parity:** Restrict perception and grasp checks strictly to
    the 4 RGB camera streams + Robotiq closure status (never read privileged
    object poses from `mj_data.xpos`).
+5. **Episode recording & offline MuJoCo replay:** Wrap `sim` or `hardware`
+   runs in `with robot.record_episode(out_dir, fps=10.0) as rec:` (or
+   `start_recording()` / `stop_recording()`), switching phases with
+   `rec.set_phase("grasp")`. Inspect logs with
+   `load_recorded_episode(out_dir)` (`RecordedEpisode`) and step logged
+   `state_16d` / `arms` poses back through MuJoCo with
+   `replay_episode_in_sim(out_dir, output_mp4="replay.mp4")` (`ReplayResult`)
+   from [fr3_recording.py](../scripts/fr3_recording.py) (re-exported by
+   [fr3_duo_robot.py](../scripts/fr3_duo_robot.py)).
 
 ---
 

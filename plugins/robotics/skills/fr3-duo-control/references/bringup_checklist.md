@@ -51,24 +51,39 @@ All stages run through the single CLI entrypoint [bringup.py](../scripts/bringup
 
 ### Turn 2 — Physical Cell Geometry & Fingertip Calibration (`--step geometry`)
 
-3. **Display/attach [fr3_duo_dimensions_reference.png](../assets/fr3_duo_dimensions_reference.png) inline** for the operator (when supported by the UI/harness) and ask them to confirm or provide the 6 floor-mounted measurements in **meters (`m`)**:
-   * **`base_height_m` (`H_base_floor`, default `0.913887 m`):** Floor straight up to the **flat center bracket underside between the shoulder cheeks (`z = z_base = +0.1639 m`, `0.163887 m` exact)**—no vertical offset needed.
-   * **`table_height_m` (`H_table_floor`, default `0.75 m`):** Floor to the tabletop surface. Derived tabletop Z in `base` frame:
-     `z_table_m = 0.163887 - (base_height_m - table_height_m)` (default yields `z_table_m = 0.0 m`).
-   * **`table_front_offset_m` (`D_edge`, default assumption `0.25 m` — operator must confirm):** Plumb down from the **front lip of that flat center bracket underside (`x = +0.0844 m`, `0.08437 m` exact, `|y| <= 0.055 m` cyan bar)** and measure horizontally forward to the table front edge (`x_front = 0.08437 + table_front_offset_m`).
-   * **`table_width_m` & `table_depth_m` (defaults `1.22 m` wide x `0.74 m` deep):** Confirm physical tabletop footprint in meters.
-   * **`tcp_offset_z_m`:** Confirm installed Robotiq fingertips (`0.145 m` stock 2F-85 silicone pads vs `0.185 m` extended fingers).
-   ```bash
-   # Preview current geometry & config completeness offline
-   uv run scripts/bringup.py --step geometry --dry-run
+3. Calibrate tabletop height (`z_table_m`), front edge (`table_front_offset_m`), footprint (`table_width_m`, `table_depth_m`), and closed fingertip offset (`tcp_offset_z_m`) using **single-arm FR3 cuff touch (`--step geometry` / `--touch-geometry`)** (if a calibrated config already exists on disk, interactive `--step geometry` prompts `[1] Reuse existing config | [2] Recalibrate (start fresh)`):
 
-   # Interactive prompt (sets geometry_confirmed=True and saves config/robot_config.json)
-   uv run scripts/bringup.py --step geometry --output-dir logs/stage1
+   * **Zero-motion single-arm FR3 cuff touch (`--step geometry` / `--touch-geometry`):**
+     * **Display/attach [cuff_touch_explainer.gif](../assets/cuff_touch_explainer.gif) and [fr3_duo_dimensions_reference.png](../assets/fr3_duo_dimensions_reference.png) inline before asking the operator to touch the closed fingertips to the table front edge** (when supported by the UI/harness) so the operator sees the required pose and tabletop footprint values.
+     * **Why use FK touch:** Reads live FCI joint angles (`q_rad`) read-only via `probe_arm_readonly` and evaluates `fr3_kinematics.compute_arm_fk`—**zero software arm motion commands are sent**. Eliminates floor/pedestal `base_height_m` & `table_height_m` tape-measure discrepancies.
+     * **Single-arm default (`--touch-arm auto`, `left` -> `right`):** Only **one** arm needs to touch the table (`left` `+Y` / operator's right when enabled, else `right`). Pass `--touch-arm both` only if you explicitly want to average both arms (rejects `|z_left - z_right| > 0.025 m`, exit code `2`).
+     * **Closed-gripper & Desk `Idle` check:** Select `tcp_offset_z_m` (`0.145 m` stock 2F-85 pads vs `0.185 m` extended ALOHA fingers) and tabletop footprint (`[1]` ALOHA `1.22 x 0.74 m` vs `[2]` custom), ensure the gripper is **CLOSED** (pass `--close-grippers` to activate and close enabled Robotiq grippers before cuff touch; skipped under `--dry-run` / `--read-only`), hold the FR3 cuff button to rest the closed fingertips on the **table front edge**, release the cuff button so Desk returns to `Idle`, and press `ENTER`. `bringup.py` warns and offers a retry if Desk is not `kIdle` or `fk_pos_error_m > 5.0 mm`.
+     ```bash
+     # Dry-run preview of single-arm cuff touch (no live FCI sockets opened)
+     uv run scripts/bringup.py --step geometry --touch-geometry --dry-run
 
-   # Explicit non-interactive calibration + confirmation
-   uv run scripts/bringup.py --step geometry --base-height-m 0.913887 --table-height-m 0.75 --table-front-offset-m 0.25 --table-width-m 1.22 --table-depth-m 0.74 --tcp-offset-z-m 0.145 --confirm-geometry
-   ```
-   * Even with `--yes`, `--step geometry` will **not** silently mark unverified default dimensions confirmed; pass explicit measurement flags + `--confirm-geometry` or complete the interactive prompt.
+     # Interactive calibration (prompts [1] Reuse / [2] Recalibrate if already calibrated, else cuff touch)
+     uv run scripts/bringup.py --step geometry --output-dir logs/stage1
+
+     # Auto-activate & close enabled Robotiq grippers before cuff touch
+     uv run scripts/bringup.py --step geometry --touch-geometry --close-grippers --output-dir logs/stage1
+
+     # Explicit single-arm cuff touch with extended closed tips
+     uv run scripts/bringup.py --step geometry --touch-geometry --tcp-offset-z-m 0.185 --output-dir logs/stage1
+
+     # Opt-in dual-arm averaging
+     uv run scripts/bringup.py --step geometry --touch-geometry --touch-arm both --output-dir logs/stage1
+     ```
+
+   * **Non-interactive CLI overrides (optional):** Explicit measurement flags (`--base-height-m`, `--table-height-m`, `--table-front-offset-m`, `--table-width-m`, `--table-depth-m`, `--tcp-offset-z-m`) + `--confirm-geometry` are also accepted for automated runs (see [fr3_duo_dimensions_reference.png](../assets/fr3_duo_dimensions_reference.png) for frame definitions).
+     ```bash
+     # Preview current geometry & config completeness offline
+     uv run scripts/bringup.py --step geometry --dry-run
+
+     # Explicit non-interactive calibration + confirmation
+     uv run scripts/bringup.py --step geometry --base-height-m 0.913887 --table-height-m 0.75 --table-front-offset-m 0.25 --table-width-m 1.22 --table-depth-m 0.74 --tcp-offset-z-m 0.145 --confirm-geometry
+     ```
+   * Even with `--yes`, standard `--step geometry` (without `--touch-geometry`) will **not** silently mark unverified default dimensions confirmed; pass explicit measurement flags + `--confirm-geometry` or run `--touch-geometry`.
    * **Completeness gate before live Stage 3/4 motion:** `bringup.py` enforces `fr3_config.validate_robot_config_complete(cfg)` before `gripper`, `nudge`, `abort-test`, and `hello-world` (exiting with code `2` and listing missing `arms.{left,right}.ip`, `arms.{left,right}.gripper_port`, `cameras.{head_stereo,wrist_camera_left,wrist_camera_right}`, or `geometry_confirmed=True`).
 
 ---
@@ -116,7 +131,8 @@ Run the full bimanual greeting (`check_robot.run_hello_world` via `bringup.py`) 
 uv run scripts/bringup.py --up-to hello-world --dry-run
 uv run scripts/bringup.py --up-to all --realtime auto --output-dir logs/stage4
 
-# Return both arms smoothly to canonical rest_pose (or dry-run first)
+# Return both arms smoothly to canonical rest_pose (or dry-run first;
+# --step home enables upward-only <= 0.015 m lift-off from initial table contact)
 uv run scripts/bringup.py --step home --dry-run
 uv run scripts/bringup.py --step home --yes
 ```

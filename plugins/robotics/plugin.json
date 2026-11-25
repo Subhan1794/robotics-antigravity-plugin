@@ -1,7 +1,7 @@
 {
   "name": "robotics",
   "displayName": "Robotics",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "category": "research",
   "logo": "assets/logo.svg",
   "description": "Robotics skills for any robot: 3D perception, collision-free motion planning, visual servoing, robot bring-up, sim2real, agent iteration, MuJoCo simulation, SimReady 3D asset authoring and physics auditing, and a live MuJoCo Studio 3D web sidecar.",

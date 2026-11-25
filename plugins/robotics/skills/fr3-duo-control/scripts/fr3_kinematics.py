@@ -25,6 +25,7 @@ import weakref
 
 import numpy as np
 
+from fr3_camera_controller import CameraCalibration
 from fr3_mjcf import (
     DEFAULT_REST_POSE_RAD,
     _require_mujoco,
@@ -247,7 +248,7 @@ def get_camera_calibration_opencv(
     right_q_rad: Sequence[float],
     *,
     resolution_wh: tuple[int, int] | None = None,
-) -> dict[str, dict[str, Any]]:
+) -> dict[str, CameraCalibration]:
   """Computes OpenCV camera intrinsics and extrinsics in `base` frame."""
   mj = _require_mujoco()
   q_l = np.asarray(left_q_rad, dtype=np.float64).reshape(-1)
@@ -260,7 +261,7 @@ def get_camera_calibration_opencv(
 
   ctx = _get_model_kinematics_ctx(mj_model)
   cv_diag = np.diag([1.0, -1.0, -1.0])
-  cal: dict[str, dict[str, Any]] = {}
+  cal: dict[str, CameraCalibration] = {}
   num_cams = int(mj_model.ncam)
 
   with ctx.lock:
@@ -351,22 +352,22 @@ def get_camera_calibration_opencv(
       else:
         t_ee_cam = None
 
-      cal[cam_name] = {
-          "width": w,
-          "height": h,
-          "K": k_mat,
-          "intrinsics_tuple": (fx, fy, cx, cy),
-          "mp_intrinsics": {
+      cal[cam_name] = CameraCalibration(
+          width=w,
+          height=h,
+          K=k_mat,
+          intrinsics_tuple=(fx, fy, cx, cy),
+          mp_intrinsics={
               "focal_px": [fx, fy],
               "principal_point_px": [cx, cy],
           },
-          "T_base_cam": t_base_cam,
-          "T_ee_cam": t_ee_cam,
-          "mj_pose": {
+          T_base_cam=t_base_cam,
+          T_ee_cam=t_ee_cam,
+          mj_pose={
               "pos": p_cam_base,
               "rot": r_cam_mj_base,
           },
-      }
+      )
   return cal
 
 

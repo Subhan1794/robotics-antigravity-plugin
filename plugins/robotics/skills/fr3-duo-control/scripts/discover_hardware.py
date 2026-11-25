@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 import os
@@ -29,7 +30,10 @@ import numpy as np
 from fr3_arm_controller import probe_arm_readonly
 from fr3_arm_controller import tcp_port_reachable
 from fr3_camera_controller import (
+    UsbPermissionsReport,
+    UvcDeviceInfo,
     V4L2Camera,
+    _DictCompatMixin,
     check_linux_usb_permissions,
     discover_uvc_devices,
     require_cv2,
@@ -53,6 +57,129 @@ from robotiq_gripper_controller import (
     resolve_serial_ports,
     select_gripper_ports,
 )
+
+
+@dataclass
+class ConflictingProcess(_DictCompatMixin):
+  """Process holding an open file descriptor on a robot device node."""
+
+  pid: int
+  process: str
+  device_path: str
+  device_label: str
+
+  def to_dict(self) -> dict[str, Any]:
+    """Returns a JSON-serializable dictionary of process conflict info."""
+    return {
+        "pid": self.pid,
+        "process": self.process,
+        "device_path": self.device_path,
+        "device_label": self.device_label,
+    }
+
+
+@dataclass
+class NominalArmFk(_DictCompatMixin):
+  """Nominal forward kinematics summary at an arm's configured rest pose."""
+
+  rest_pose_rad: list[float]
+  tcp_pos_base_m: list[float]
+  tcp_z_axis_base: list[float]
+
+  def to_dict(self) -> dict[str, list[float]]:
+    """Returns a JSON-serializable dictionary of nominal arm FK."""
+    return {
+        "rest_pose_rad": list(self.rest_pose_rad),
+        "tcp_pos_base_m": list(self.tcp_pos_base_m),
+        "tcp_z_axis_base": list(self.tcp_z_axis_base),
+    }
+
+
+@dataclass
+class FciTargetStatus(_DictCompatMixin):
+  """TCP 1337 reachability status for one FR3 FCI controller IP."""
+
+  ip: str
+  tcp_1337_reachable: bool
+
+  def to_dict(self) -> dict[str, Any]:
+    """Returns a JSON-serializable dictionary of FCI target status."""
+    return {
+        "ip": self.ip,
+        "tcp_1337_reachable": self.tcp_1337_reachable,
+    }
+
+
+@dataclass
+class DiscoveryReport(_DictCompatMixin):
+  """Structured Stage 1 hardware discovery and preflight report."""
+
+  timestamp_utc: str
+  stage: str
+  mode: str
+  dry_run: bool
+  read_only: bool
+  menagerie_found: bool
+  menagerie_dir: str | None
+  preempt_rt_detected: bool
+  realtime_profile: dict[str, Any]
+  realtime_error: str | None
+  fci_targets: dict[str, FciTargetStatus]
+  serial_ports: list[dict[str, Any]]
+  gripper_selection: dict[str, Any]
+  uvc_devices: list[UvcDeviceInfo | dict[str, Any]]
+  usb_permissions: UsbPermissionsReport | dict[str, Any]
+  conflicting_processes: list[ConflictingProcess]
+  nominal_fk: dict[str, NominalArmFk]
+  arm_readout: dict[str, Any]
+  warnings: list[str]
+  advisories: list[str]
+  wrote_config: str | None
+  wrist_mapping_confirmed: bool
+  discovered_config: dict[str, Any]
+  report_path: str | None = None
+
+  def to_dict(self) -> dict[str, Any]:
+    """Returns a JSON-serializable dictionary of the discovery report."""
+    out: dict[str, Any] = {
+        "timestamp_utc": self.timestamp_utc,
+        "stage": self.stage,
+        "mode": self.mode,
+        "dry_run": self.dry_run,
+        "read_only": self.read_only,
+        "menagerie_found": self.menagerie_found,
+        "menagerie_dir": self.menagerie_dir,
+        "preempt_rt_detected": self.preempt_rt_detected,
+        "realtime_profile": self.realtime_profile,
+        "realtime_error": self.realtime_error,
+        "fci_targets": {
+            k: v.to_dict() for k, v in self.fci_targets.items()
+        },
+        "serial_ports": list(self.serial_ports),
+        "gripper_selection": self.gripper_selection,
+        "uvc_devices": [
+            d.to_dict() if hasattr(d, "to_dict") else d
+            for d in self.uvc_devices
+        ],
+        "usb_permissions": (
+            self.usb_permissions.to_dict()
+            if hasattr(self.usb_permissions, "to_dict")
+            else self.usb_permissions
+        ),
+        "conflicting_processes": [
+            c.to_dict() for c in self.conflicting_processes
+        ],
+        "nominal_fk": {k: v.to_dict() for k, v in self.nominal_fk.items()},
+        "arm_readout": self.arm_readout,
+        "warnings": list(self.warnings),
+        "advisories": list(self.advisories),
+        "wrote_config": self.wrote_config,
+        "wrist_mapping_confirmed": self.wrist_mapping_confirmed,
+        "discovered_config": self.discovered_config,
+    }
+    if self.report_path is not None:
+      out["report_path"] = self.report_path
+    return out
 
 
 def _capture_wrist_preview_png(
@@ -184,7 +311,7 @@ def _discover_grippers(
 
 def _discover_cameras(
     cfg: RobotConfig, *, rediscover: bool
-) -> list[dict[str, Any]]:
+) -> list[UvcDeviceInfo]:
   """Discovers UVC devices or reuses valid configured camera paths."""
   configured_cams = cfg.cameras.as_spec_map()
   has_configured = bool(
@@ -198,21 +325,28 @@ def _discover_cameras(
     return discover_uvc_devices()
 
   return [
-      {
-          "name": role,
-          "family": "zed" if role == "head_stereo" else "realsense",
-          "device_path": sp.device_path,
-          "video_node": os.path.realpath(sp.device_path),
-          "serial": sp.serial,
-          "v4l2_rw_ok": os.access(sp.device_path, os.R_OK | os.W_OK),
-      }
+      UvcDeviceInfo(
+          name=role,
+          family="zed" if role == "head_stereo" else "realsense",
+          device_path=sp.device_path,
+          video_node=os.path.realpath(sp.device_path),
+          serial=sp.serial,
+          vendor_id="",
+          product_id="",
+          busnum="",
+          usb_speed_mbps=0.0,
+          is_usb3=False,
+          interface="",
+          power_control="",
+          v4l2_rw_ok=os.access(sp.device_path, os.R_OK | os.W_OK),
+      )
       for role, sp in configured_cams.items()
   ]
 
 
 def _collect_hardware_device_labels(
     serial_nodes: Sequence[Mapping[str, Any]],
-    uvc_devices: Sequence[Mapping[str, Any]],
+    uvc_devices: Sequence[UvcDeviceInfo | Mapping[str, Any]],
 ) -> dict[str, str]:
   """Maps resolved `/dev/...` paths for discovered hardware to display labels."""
   dev_labels: dict[str, str] = {}
@@ -238,18 +372,18 @@ def _collect_hardware_device_labels(
 
 def find_conflicting_hardware_processes(
     serial_nodes: Sequence[Mapping[str, Any]],
-    uvc_devices: Sequence[Mapping[str, Any]],
+    uvc_devices: Sequence[UvcDeviceInfo | Mapping[str, Any]],
     *,
     proc_root: Path = Path("/proc"),
     own_pid: int | None = None,
-) -> list[dict[str, Any]]:
+) -> list[ConflictingProcess]:
   """Finds other Linux processes holding open FDs on robot serial/V4L2 nodes."""
   dev_labels = _collect_hardware_device_labels(serial_nodes, uvc_devices)
   if not dev_labels or not proc_root.is_dir():
     return []
 
   self_pid = os.getpid() if own_pid is None else int(own_pid)
-  conflicts: list[dict[str, Any]] = []
+  conflicts: list[ConflictingProcess] = []
   seen: set[tuple[int, str]] = set()
   try:
     proc_entries = sorted(proc_root.iterdir(), key=lambda p: p.name)
@@ -292,18 +426,20 @@ def find_conflicting_hardware_processes(
           )
         except OSError:
           comm = "unknown"
-      conflicts.append({
-          "pid": pid,
-          "process": comm,
-          "device_path": norm_target,
-          "device_label": label,
-      })
+      conflicts.append(
+          ConflictingProcess(
+              pid=pid,
+              process=comm,
+              device_path=norm_target,
+              device_label=label,
+          )
+      )
   return conflicts
 
 
 def _append_usb_permission_warnings(
-    usb_permissions: Mapping[str, Any],
-    uvc_devices: list[dict[str, Any]],
+    usb_permissions: UsbPermissionsReport | Mapping[str, Any],
+    uvc_devices: Sequence[UvcDeviceInfo | Mapping[str, Any]],
     warnings_list: list[str],
 ) -> None:
   """Appends human-actionable dialout/video R/W permission warnings."""
@@ -345,7 +481,7 @@ def _append_usb_permission_warnings(
 def _auto_bind_devices(
     cfg: RobotConfig,
     gripper_selection: Mapping[str, Any],
-    uvc_devices: list[dict[str, Any]],
+    uvc_devices: Sequence[UvcDeviceInfo | Mapping[str, Any]],
 ) -> list[str]:
   """Auto-binds discovered gripper ports, ZED stereo, and D405 wrists."""
   for side in ("left", "right"):
@@ -358,10 +494,10 @@ def _auto_bind_devices(
     zed = zed_cams[0]
     z_ser = str(zed.get("serial") or "")
     z_dev = str(zed.get("device_path") or zed.get("video_node") or "")
-    search_dirs = [cfg.zed_settings_dir]
-    found_conf = resolve_zed_conf_path(serial=z_ser, search_dirs=search_dirs)
-    if found_conf is None and (not z_ser or not z_ser.isdigit()):
-      found_conf = resolve_zed_conf_path(serial="", search_dirs=search_dirs)
+    head_cfg = cfg.cameras.head_stereo
+    found_conf = resolve_zed_conf_path(
+        serial=z_ser, explicit_path=head_cfg.zed_conf_path
+    )
     if found_conf is not None and (not z_ser or z_ser.upper() == "OV580"):
       conf_stem = found_conf.stem
       if conf_stem.lower().startswith("sn") and len(conf_stem) > 2:
@@ -369,12 +505,13 @@ def _auto_bind_devices(
         for d in uvc_devices:
           if d.get("family") == "zed" and not d.get("serial"):
             d["serial"] = z_ser
-    head_cfg = cfg.cameras.head_stereo
     if not head_cfg.serial and z_ser:
       head_cfg.serial = z_ser
     if not head_cfg.device_path and z_dev:
       head_cfg.device_path = z_dev
-    if found_conf and not head_cfg.zed_conf_path:
+    if found_conf is not None and (
+        not head_cfg.zed_conf_path or Path(head_cfg.zed_conf_path).is_dir()
+    ):
       head_cfg.zed_conf_path = str(found_conf)
 
   unique_rs = sorted(
@@ -441,7 +578,7 @@ def _auto_bind_devices(
 def _print_discovery_summary(
     *,
     cfg: RobotConfig,
-    report: Mapping[str, Any],
+    report: DiscoveryReport | Mapping[str, Any],
     menagerie_path: Path | None,
 ) -> None:
   """Prints concise human-readable Stage 1 discovery telemetry."""
@@ -563,7 +700,7 @@ def run_discovery(
     rediscover: bool = False,
     yes: bool = False,
     input_fn: Callable[[str], str] | None = None,
-) -> tuple[int, dict[str, Any]]:
+) -> tuple[int, DiscoveryReport]:
   """Runs Stage 1 read-only hardware discovery and returns `(rc, report)`."""
   cfg = normalize_robot_config(config)
   is_preempt_rt = detect_preempt_rt()
@@ -586,23 +723,23 @@ def run_discovery(
   if menagerie_path is None:
     menagerie_path = find_menagerie_dir()
 
-  nominal_fk: dict[str, Any] = {}
-  fci_reachability: dict[str, Any] = {}
+  nominal_fk: dict[str, NominalArmFk] = {}
+  fci_reachability: dict[str, FciTargetStatus] = {}
   for arm in ("left", "right"):
     q_rest = cfg.arms[arm].rest_pose_rad
     pos_b, rot_b = compute_arm_fk(mj_model, arm, q_rest)
-    nominal_fk[arm] = {
-        "rest_pose_rad": [round(float(v), 6) for v in q_rest],
-        "tcp_pos_base_m": [round(float(v), 5) for v in pos_b],
-        "tcp_z_axis_base": [round(float(v), 5) for v in rot_b[:, 2]],
-    }
+    nominal_fk[arm] = NominalArmFk(
+        rest_pose_rad=[round(float(v), 6) for v in q_rest],
+        tcp_pos_base_m=[round(float(v), 5) for v in pos_b],
+        tcp_z_axis_base=[round(float(v), 5) for v in rot_b[:, 2]],
+    )
     ip = cfg.arms[arm].ip
-    fci_reachability[arm] = {
-        "ip": ip,
-        "tcp_1337_reachable": tcp_port_reachable(
+    fci_reachability[arm] = FciTargetStatus(
+        ip=ip,
+        tcp_1337_reachable=tcp_port_reachable(
             ip, timeout_s=ping_timeout_sec
         ),
-    }
+    )
 
   warnings_list: list[str] = list(gripper_selection.get("warnings", []))
   advisories_list: list[str] = list(gripper_selection.get("advisories", []))
@@ -612,8 +749,8 @@ def run_discovery(
   )
   for proc_conflict in conflicting_processes:
     warnings_list.append(
-        f"Process '{proc_conflict['process']}' (PID {proc_conflict['pid']}) "
-        f"already holds {proc_conflict['device_label']}; kill conflicting "
+        f"Process '{proc_conflict.process}' (PID {proc_conflict.pid}) "
+        f"already holds {proc_conflict.device_label}; kill conflicting "
         "camera/serial processes before continuing."
     )
 
@@ -699,33 +836,33 @@ def run_discovery(
     save_robot_config(cfg, write_config)
     wrote_cfg_path = str(write_config)
 
-  report: dict[str, Any] = {
-      "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-      "stage": "stage1_discover_hardware",
-      "mode": "hardware_readonly",
-      "dry_run": False,
-      "read_only": bool(read_only or write_config is None),
-      "menagerie_found": menagerie_path is not None,
-      "menagerie_dir": (
+  report = DiscoveryReport(
+      timestamp_utc=datetime.now(timezone.utc).isoformat(),
+      stage="stage1_discover_hardware",
+      mode="hardware_readonly",
+      dry_run=False,
+      read_only=bool(read_only or write_config is None),
+      menagerie_found=menagerie_path is not None,
+      menagerie_dir=(
           str(menagerie_path) if menagerie_path is not None else None
       ),
-      "preempt_rt_detected": is_preempt_rt,
-      "realtime_profile": rt_profile,
-      "realtime_error": realtime_error,
-      "fci_targets": fci_reachability,
-      "serial_ports": serial_ports,
-      "gripper_selection": gripper_selection,
-      "uvc_devices": uvc_devices,
-      "usb_permissions": usb_permissions,
-      "conflicting_processes": conflicting_processes,
-      "nominal_fk": nominal_fk,
-      "arm_readout": arm_readout,
-      "warnings": warnings_list,
-      "advisories": advisories_list,
-      "wrote_config": wrote_cfg_path,
-      "wrist_mapping_confirmed": wrist_confirmed,
-      "discovered_config": cfg.to_dict(),
-  }
+      preempt_rt_detected=is_preempt_rt,
+      realtime_profile=rt_profile,
+      realtime_error=realtime_error,
+      fci_targets=fci_reachability,
+      serial_ports=serial_ports,
+      gripper_selection=gripper_selection,
+      uvc_devices=uvc_devices,
+      usb_permissions=usb_permissions,
+      conflicting_processes=conflicting_processes,
+      nominal_fk=nominal_fk,
+      arm_readout=arm_readout,
+      warnings=warnings_list,
+      advisories=advisories_list,
+      wrote_config=wrote_cfg_path,
+      wrist_mapping_confirmed=wrist_confirmed,
+      discovered_config=cfg.to_dict(),
+  )
   json_path = output_json or (
       resolved_out_dir / "discovery_report.json"
       if resolved_out_dir is not None
@@ -733,8 +870,10 @@ def run_discovery(
   )
   if json_path is not None:
     json_path.parent.mkdir(parents=True, exist_ok=True)
-    json_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    report["report_path"] = str(json_path)
+    json_path.write_text(
+        json.dumps(report.to_dict(), indent=2) + "\n", encoding="utf-8"
+    )
+    report.report_path = str(json_path)
 
   _print_discovery_summary(
       cfg=cfg, report=report, menagerie_path=menagerie_path

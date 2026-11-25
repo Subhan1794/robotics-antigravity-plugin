@@ -13,6 +13,8 @@
 # limitations under the License.
 """Robot-agnostic Image-Based Visual Servoing (IBVS) and ray-plane geometry."""
 
+from __future__ import annotations
+
 from collections.abc import Sequence
 from typing import Any
 import numpy as np
@@ -201,7 +203,12 @@ def match_keypoints(
 
 
 class Ibvs:
-  """Computes damped IBVS camera/EE twists and analytical hover-plane poses."""
+  """Computes damped IBVS camera/EE twists and analytical hover-plane poses.
+
+  Note: `T_ee_cam` and `T_world_cam` use OpenCV pinhole axes (+X right,
+  +Y down, +Z forward; from MJCF use `mp.get_camera_poses_opencv`, never raw
+  `cam_xmat`).
+  """
 
   def __init__(
       self,
@@ -497,7 +504,8 @@ class Ibvs:
           (uv[:, 1] - float(cy_px)) / float(fy_px),
           np.ones(uv.shape[0], dtype=np.float64),
       ])
-      rays_w = rays_c @ r_cam.T
+      with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+        rays_w = rays_c @ np.ascontiguousarray(r_cam.T)
       non_parallel = np.abs(rays_w[:, 2]) > 1e-6
       s = np.full(uv.shape[0], -1.0, dtype=np.float64)
       s[non_parallel] = (float(z_plane_m) - float(p_cam[2])) / rays_w[
@@ -535,14 +543,16 @@ class Ibvs:
 
     mean_xy = np.sum(xy_w * w_norm[:, None], axis=0)
     centered = xy_w - mean_xy
-    cov = (centered * w_norm[:, None]).T @ centered
+    with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+      cov = (centered * w_norm[:, None]).T @ centered
     eigvals, eigvecs = np.linalg.eigh(cov)
     major, yaw_rad = _canonicalize_axis(eigvecs[:, 1], prev_yaw_rad)
     minor = np.array([-major[1], major[0]], dtype=np.float64)
     anisotropy = float(max(eigvals[1], 0.0) / max(eigvals[0], 1e-12))
 
-    proj_major = centered @ major
-    proj_minor = centered @ minor
+    with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+      proj_major = centered @ major
+      proj_minor = centered @ minor
     obb_xy = (
         mean_xy
         + 0.5 * (float(proj_major.min()) + float(proj_major.max())) * major

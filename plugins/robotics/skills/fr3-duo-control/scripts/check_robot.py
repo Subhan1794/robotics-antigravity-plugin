@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
 import math
@@ -30,21 +31,20 @@ from typing import Any
 import numpy as np
 
 from fr3_arm_controller import validate_arm_readiness
-from fr3_camera_controller import Fr3DuoCameraController, render_contact_sheet
+from fr3_camera_controller import Fr3DuoCameraController
 from fr3_config import (
     RobotConfig,
     normalize_robot_config,
-    open_mp4_writer,
     resolve_realtime_config,
     resolve_stage_output_dir,
-    save_rgb_png,
 )
-from fr3_duo_robot import Fr3DuoRobot
+from fr3_duo_robot import Fr3DuoRobot, RobotState
 from fr3_kinematics import compute_arm_fk
 from fr3_mjcf import (
     FR3_IK_MARGINS_RAD,
     FR3_JOINT_LIMITS_RAD,
 )
+from fr3_recording import MosaicVideoWriter, _DictCompatMixin
 from fr3_safety import (
     AbortWatcher,
     Fr3DuoSafetyChecker,
@@ -55,6 +55,98 @@ from robotiq_gripper_controller import EMPTY_CLOSE_MIN_RATIO
 
 GREETING_DELTA_LEFT_RAD = (0.08, -0.08, 0.0, 0.12, 0.0, 0.10, 0.0)
 GREETING_DELTA_RIGHT_RAD = (-0.08, -0.08, 0.0, 0.12, 0.0, 0.10, 0.0)
+_MOTION_PHASES = frozenset(
+    {"outbound_greeting", "gripper_cycle", "return_to_rest"}
+)
+
+
+@dataclass
+class HelloWorldReport(_DictCompatMixin):
+  """Structured Stage 4 Hello World report written to JSON."""
+
+  timestamp_utc: str
+  stage: str
+  mode: str
+  dry_run: bool
+  min_tcp_z_base_m: float | None = None
+  min_inter_arm_tcp_dist_m: float | None = None
+  outbound_steps_1khz: int | None = None
+  max_speed_deg_s: float | None = None
+  aborted: bool | None = None
+  frames_written: int | None = None
+  motion_frames_written: int | None = None
+  mp4_path: str | None = None
+  jsonl_path: str | None = None
+  contact_sheet_path: str | None = None
+  gripper_summary: dict[str, Any] | None = None
+  preflight_blocked: bool | None = None
+  warnings: list[str] | None = None
+  report_path: str | None = None
+
+  def to_dict(self) -> dict[str, Any]:
+    """Converts the Hello World report to a JSON-serializable dict."""
+    out: dict[str, Any] = {
+        "timestamp_utc": self.timestamp_utc,
+        "stage": self.stage,
+        "mode": self.mode,
+        "dry_run": self.dry_run,
+    }
+    optional_fields = (
+        "min_tcp_z_base_m",
+        "min_inter_arm_tcp_dist_m",
+        "outbound_steps_1khz",
+        "max_speed_deg_s",
+        "aborted",
+        "frames_written",
+        "motion_frames_written",
+        "mp4_path",
+        "jsonl_path",
+        "contact_sheet_path",
+        "gripper_summary",
+        "preflight_blocked",
+        "warnings",
+        "report_path",
+    )
+    for name in optional_fields:
+      val = getattr(self, name)
+      if val is not None:
+        out[name] = val
+    return out
+
+
+@dataclass
+class RobotCheckReport(_DictCompatMixin):
+  """Structured Stage 3 robot check report written to JSON."""
+
+  timestamp_utc: str
+  stage: str
+  check_mode: str
+  execution_mode: str
+  dry_run: bool
+  preflight_blocked: bool
+  realtime_profile: dict[str, Any]
+  preview: dict[str, Any]
+  results: dict[str, Any] = field(default_factory=dict)
+  warnings: list[str] = field(default_factory=list)
+  report_path: str | None = None
+
+  def to_dict(self) -> dict[str, Any]:
+    """Converts the robot check report to a JSON-serializable dict."""
+    out: dict[str, Any] = {
+        "timestamp_utc": self.timestamp_utc,
+        "stage": self.stage,
+        "check_mode": self.check_mode,
+        "execution_mode": self.execution_mode,
+        "dry_run": self.dry_run,
+        "preflight_blocked": self.preflight_blocked,
+        "realtime_profile": dict(self.realtime_profile),
+        "preview": dict(self.preview),
+        "results": dict(self.results),
+        "warnings": list(self.warnings),
+    }
+    if self.report_path is not None:
+      out["report_path"] = self.report_path
+    return out
 
 
 def _build_nudge_target(
@@ -147,21 +239,16 @@ def _execute_greeting_with_recording(
     max_speed_deg_s: float,
 ) -> tuple[bool, int, int, dict[str, Any]]:
   """Runs Stage 4 greeting + gripper cycle while recording 4-camera MP4."""
-  first_batch = rig.capture_all()
-  first_mosaic = render_contact_sheet(first_batch)
-  save_rgb_png(first_mosaic, sheet_path)
-  writer = open_mp4_writer(
+  writer = MosaicVideoWriter(
       mp4_path,
-      width=int(first_mosaic.shape[1]),
-      height=int(first_mosaic.shape[0]),
       fps=fps,
+      first_frame_path=sheet_path,
   )
   jsonl_path.parent.mkdir(parents=True, exist_ok=True)
   record_lock = threading.Lock()
   stop_rec = threading.Event()
   current_phase = "pre_motion"
   rec_errors: list[Exception] = []
-  frames_written = 0
   motion_frames_written = 0
   aborted = False
   gripper_summary: dict[str, Any] = {}
@@ -170,18 +257,11 @@ def _execute_greeting_with_recording(
     with jsonl_path.open("w", encoding="utf-8") as log_f:
 
       def _write_one_frame(phase_label: str) -> None:
-        nonlocal frames_written, motion_frames_written
+        nonlocal motion_frames_written
         batch = rig.capture_all()
-        mosaic = render_contact_sheet(batch)
         with record_lock:
-          writer.write(np.ascontiguousarray(mosaic[:, :, ::-1]))
-          idx_now = frames_written
-          frames_written += 1
-          if phase_label in (
-              "outbound_greeting",
-              "gripper_cycle",
-              "return_to_rest",
-          ):
+          idx_now, _ = writer.write_batch(batch)
+          if phase_label in _MOTION_PHASES:
             motion_frames_written += 1
           event = {
               "frame_index": idx_now,
@@ -210,8 +290,8 @@ def _execute_greeting_with_recording(
 
       try:
         st_init = robot.read_state()
-        ql_start = clamp_q_to_padded_limits(st_init["left"]["q_rad"]).tolist()
-        qr_start = clamp_q_to_padded_limits(st_init["right"]["q_rad"]).tolist()
+        ql_start = clamp_q_to_padded_limits(st_init.left.q_rad).tolist()
+        qr_start = clamp_q_to_padded_limits(st_init.right.q_rad).tolist()
         ql_mid = clamp_q_to_padded_limits(
             [q + dq for q, dq in zip(ql_start, GREETING_DELTA_LEFT_RAD)]
         ).tolist()
@@ -227,7 +307,7 @@ def _execute_greeting_with_recording(
               abort_watcher=watcher,
               speed_deg_s=min(max_speed_deg_s, 20.0),
           )
-          aborted = bool(out_res.get("aborted", False))
+          aborted = bool(out_res.aborted)
 
           if not aborted:
             current_phase = "gripper_cycle"
@@ -249,7 +329,7 @@ def _execute_greeting_with_recording(
                 abort_watcher=watcher,
                 speed_deg_s=min(max_speed_deg_s, 20.0),
             )
-            aborted = aborted or bool(ret_res.get("aborted", False))
+            aborted = aborted or bool(ret_res.aborted)
       finally:
         stop_rec.set()
         rec_thread.join(timeout=2.0)
@@ -261,9 +341,14 @@ def _execute_greeting_with_recording(
         ) from rec_errors[0]
       _write_one_frame("returned_to_rest")
   finally:
-    writer.release()
+    summary = writer.close()
 
-  return aborted, frames_written, motion_frames_written, gripper_summary
+  return (
+      aborted,
+      int(summary.frame_count),
+      motion_frames_written,
+      gripper_summary,
+  )
 
 
 def run_hello_world(
@@ -276,7 +361,7 @@ def run_hello_world(
     output_mp4: Path | None = None,
     output_json: Path | None = None,
     robot_factory: Callable[..., Fr3DuoRobot] | None = None,
-) -> tuple[int, dict[str, Any]]:
+) -> tuple[int, HelloWorldReport]:
   """Runs Stage 4 offline trajectory preview or live bimanual Hello World."""
   cfg = normalize_robot_config(config)
   effective_dry_run = bool(dry_run)
@@ -294,16 +379,16 @@ def run_hello_world(
   mode_label = "dry_run" if effective_dry_run else "hardware"
 
   if effective_dry_run:
-    report: dict[str, Any] = {
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-        "stage": "stage4_hello_world",
-        "mode": mode_label,
-        "dry_run": True,
-        "min_tcp_z_base_m": round(min_tcp_z, 5),
-        "min_inter_arm_tcp_dist_m": round(min_tcp_dist, 5),
-        "outbound_steps_1khz": int(n_preview),
-        "max_speed_deg_s": max_speed_deg_s,
-    }
+    report = HelloWorldReport(
+        timestamp_utc=datetime.now(timezone.utc).isoformat(),
+        stage="stage4_hello_world",
+        mode=mode_label,
+        dry_run=True,
+        min_tcp_z_base_m=round(min_tcp_z, 5),
+        min_inter_arm_tcp_dist_m=round(min_tcp_dist, 5),
+        outbound_steps_1khz=int(n_preview),
+        max_speed_deg_s=max_speed_deg_s,
+    )
     json_path = output_json or (
         resolved_out_dir / "stage4_hello_world.json"
         if resolved_out_dir is not None
@@ -312,9 +397,9 @@ def run_hello_world(
     if json_path is not None:
       json_path.parent.mkdir(parents=True, exist_ok=True)
       json_path.write_text(
-          json.dumps(report, indent=2) + "\n", encoding="utf-8"
+          json.dumps(report.to_dict(), indent=2) + "\n", encoding="utf-8"
       )
-      report["report_path"] = str(json_path)
+      report.report_path = str(json_path)
     print(
         f"[DRY-RUN] Stage 4 FR3 Duo Hello World | "
         f"min_tcp_z={min_tcp_z:.4f} m | min_tcp_dist={min_tcp_dist:.4f} m | "
@@ -352,22 +437,30 @@ def run_hello_world(
           f"{len(readiness_warnings)} preflight warning(s).",
           file=sys.stderr,
       )
-      return 2, {
-          "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-          "stage": "stage4_hello_world",
-          "mode": mode_label,
-          "dry_run": False,
-          "preflight_blocked": True,
-          "warnings": readiness_warnings,
-      }
+      return 2, HelloWorldReport(
+          timestamp_utc=datetime.now(timezone.utc).isoformat(),
+          stage="stage4_hello_world",
+          mode=mode_label,
+          dry_run=False,
+          preflight_blocked=True,
+          warnings=readiness_warnings,
+      )
     with Fr3DuoCameraController(specs=cfg.cameras, dry_run=False) as rig:
       freshness = rig.check_freshness(
           max_age_s=0.30, num_reads=2, interval_s=0.05
       )
-      if not freshness["ok"]:
-        raise RuntimeError(
-            f"Camera pre-flight failed: {freshness['errors']}"
-        )
+      fresh_ok = bool(
+          freshness["ok"]
+          if isinstance(freshness, Mapping)
+          else freshness.ok
+      )
+      fresh_errs = (
+          freshness["errors"]
+          if isinstance(freshness, Mapping)
+          else freshness.errors
+      )
+      if not fresh_ok:
+        raise RuntimeError(f"Camera pre-flight failed: {fresh_errs}")
       aborted, frames_written, motion_frames_written, gripper_summary = (
           _execute_greeting_with_recording(
               robot,
@@ -385,24 +478,26 @@ def run_hello_world(
         f"Failed to encode valid Stage 4 MP4 video at {mp4_path}"
     )
 
-  report = {
-      "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-      "stage": "stage4_hello_world",
-      "mode": mode_label,
-      "dry_run": False,
-      "aborted": aborted,
-      "frames_written": frames_written,
-      "motion_frames_written": motion_frames_written,
-      "mp4_path": str(mp4_path),
-      "jsonl_path": str(jsonl_path),
-      "contact_sheet_path": str(sheet_path),
-      "min_tcp_z_base_m": round(min_tcp_z, 5),
-      "min_inter_arm_tcp_dist_m": round(min_tcp_dist, 5),
-      "gripper_summary": gripper_summary,
-  }
+  report = HelloWorldReport(
+      timestamp_utc=datetime.now(timezone.utc).isoformat(),
+      stage="stage4_hello_world",
+      mode=mode_label,
+      dry_run=False,
+      aborted=aborted,
+      frames_written=frames_written,
+      motion_frames_written=motion_frames_written,
+      mp4_path=str(mp4_path),
+      jsonl_path=str(jsonl_path),
+      contact_sheet_path=str(sheet_path),
+      min_tcp_z_base_m=round(min_tcp_z, 5),
+      min_inter_arm_tcp_dist_m=round(min_tcp_dist, 5),
+      gripper_summary=gripper_summary,
+  )
   json_path.parent.mkdir(parents=True, exist_ok=True)
-  json_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-  report["report_path"] = str(json_path)
+  json_path.write_text(
+      json.dumps(report.to_dict(), indent=2) + "\n", encoding="utf-8"
+  )
+  report.report_path = str(json_path)
 
   print(
       f"[{mode_label.upper()}] Stage 4 FR3 Duo Hello World | aborted={aborted}"
@@ -475,7 +570,7 @@ def _run_live_robot_mode(
     selected_arms: tuple[str, ...],
     eff_delta_deg: float,
     max_speed_deg_s: float,
-    st0: Mapping[str, Any],
+    st0: RobotState,
     results: dict[str, Any],
     warnings_list: list[str],
 ) -> None:
@@ -518,7 +613,9 @@ def _run_live_robot_mode(
             abort_watcher=watcher,
             speed_deg_s=min(max_speed_deg_s, 15.0),
         )
-        results[side]["nudge"] = move_res
+        results[side]["nudge"] = (
+            move_res.to_dict() if hasattr(move_res, "to_dict") else move_res
+        )
         if watcher.aborted:
           break
     return
@@ -556,8 +653,11 @@ def _run_live_robot_mode(
         if timer is not None:
           timer.cancel()
     grip_after = float(robot.read_state()[target_arm]["gripper_ratio"])
+    move_dict = (
+        move_res.to_dict() if hasattr(move_res, "to_dict") else dict(move_res)
+    )
     results[target_arm]["abort_test"] = {
-        **move_res,
+        **move_dict,
         "gripper_preserved": abs(grip_after - grip_before) < 1e-3,
     }
     return
@@ -583,12 +683,12 @@ def _run_live_robot_mode(
         results["left"]["home"] = {
             "ok": move_res["ok"],
             "aborted": move_res["aborted"],
-            "final_q_rad": move_res["final_left_q_rad"],
+            "final_q_rad": list(move_res["final_left_q_rad"]),
         }
         results["right"]["home"] = {
             "ok": move_res["ok"],
             "aborted": move_res["aborted"],
-            "final_q_rad": move_res["final_right_q_rad"],
+            "final_q_rad": list(move_res["final_right_q_rad"]),
         }
       else:
         side = selected_arms[0]
@@ -596,8 +696,11 @@ def _run_live_robot_mode(
         q_home = clamp_q_to_padded_limits(
             cfg.arms[side].rest_pose_rad
         ).tolist()
-        results[side]["home"] = robot.move_arm_waypoints(
+        home_res = robot.move_arm_waypoints(
             side, [q_now, q_home], abort_watcher=watcher, speed_deg_s=speed_cap
+        )
+        results[side]["home"] = (
+            home_res.to_dict() if hasattr(home_res, "to_dict") else home_res
         )
 
 
@@ -615,7 +718,7 @@ def run_robot_check(
     output_mp4: Path | None = None,
     output_json: Path | None = None,
     robot_factory: Callable[..., Fr3DuoRobot] | None = None,
-) -> tuple[int, dict[str, Any]]:
+) -> tuple[int, RobotCheckReport | HelloWorldReport]:
   """Runs Stage 3-4 offline trajectory check or live robot verification."""
   valid_modes = (
       "check",
@@ -714,18 +817,18 @@ def run_robot_check(
         )
 
   mode_label = "dry_run" if effective_dry_run else "hardware"
-  report: dict[str, Any] = {
-      "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-      "stage": "stage3_check_robot",
-      "check_mode": eff_mode,
-      "execution_mode": mode_label,
-      "dry_run": effective_dry_run,
-      "preflight_blocked": preflight_blocked,
-      "realtime_profile": rt_info,
-      "preview": preview,
-      "results": results,
-      "warnings": warnings_list,
-  }
+  report = RobotCheckReport(
+      timestamp_utc=datetime.now(timezone.utc).isoformat(),
+      stage="stage3_check_robot",
+      check_mode=eff_mode,
+      execution_mode=mode_label,
+      dry_run=effective_dry_run,
+      preflight_blocked=preflight_blocked,
+      realtime_profile=dict(rt_info),
+      preview=preview,
+      results=results,
+      warnings=warnings_list,
+  )
 
   resolved_out_dir = resolve_stage_output_dir(
       "stage3", output_dir, dry_run=effective_dry_run
@@ -737,8 +840,10 @@ def run_robot_check(
   )
   if json_path is not None:
     json_path.parent.mkdir(parents=True, exist_ok=True)
-    json_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    report["report_path"] = str(json_path)
+    json_path.write_text(
+        json.dumps(report.to_dict(), indent=2) + "\n", encoding="utf-8"
+    )
+    report.report_path = str(json_path)
 
   tag = "[DRY-RUN]" if effective_dry_run else "[HARDWARE]"
   print(

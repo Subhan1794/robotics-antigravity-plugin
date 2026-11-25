@@ -13,6 +13,8 @@
 # limitations under the License.
 """Robot-agnostic RGB metric 3D localization: ray-plane, homography & stereo."""
 
+from __future__ import annotations
+
 from typing import Any
 import numpy as np
 
@@ -50,7 +52,30 @@ def ray_plane_contour_pose(
     roi_mask: np.ndarray | None = None,
     prev_yaw_rad: float | None = None,
 ) -> dict[str, float] | None:
-  """Projects a foreground mask onto z = z_plane_m for perspective-free 3D pose."""
+  """Projects a foreground mask onto z = z_plane_m for perspective-free 3D pose.
+
+  Note: `t_world_cam` uses OpenCV pinhole axes (+X right, +Y down, +Z forward;
+  from MJCF use `mp.get_camera_poses_opencv`, never raw `cam_xmat`).
+
+  Args:
+    mask_u8: Foreground binary/uint8 segmentation mask of shape `(H, W)`.
+    k_mat: `(3, 3)` pinhole intrinsic matrix `K`.
+    t_world_cam: `(4, 4)` camera-to-world transform in OpenCV camera axes.
+    z_plane_m: Target horizontal support-plane height `z` in world meters.
+    min_area_px: Minimum contour area in pixels.
+    min_aspect: Minimum bounding-box aspect ratio filter.
+    roi_mask: Optional `(H, W)` mask excluding robot/background regions.
+    prev_yaw_rad: Optional prior yaw in radians for sign disambiguation.
+
+  Returns:
+    Dict with 'x_m', 'y_m', 'z_m', 'yaw_rad', 'anisotropy', 'length_m',
+    'width_m', and 'aspect', or None if no foreground contour meets
+    min_area_px/min_aspect or fewer than 4 valid in-front contour rays
+    intersect z = z_plane_m.
+
+  Raises:
+    ValueError: If `roi_mask` shape does not match `mask_u8` shape.
+  """
   work = (np.asarray(mask_u8) > 0).astype(np.uint8) * 255
   if roi_mask is not None:
     roi = np.asarray(roi_mask) > 0
@@ -105,7 +130,8 @@ def ray_plane_contour_pose(
       (pts_uv[:, 1] - cy) / fy,
       np.ones(pts_uv.shape[0], dtype=np.float64),
   ])
-  rays_w = rays_c @ r_cam.T
+  with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+    rays_w = rays_c @ np.ascontiguousarray(r_cam.T)
   non_parallel = np.abs(rays_w[:, 2]) > 1e-6
   if np.count_nonzero(non_parallel) < 4:
     return None
@@ -154,14 +180,16 @@ def ray_plane_contour_pose(
 
   mean_xy = np.sum(xy_w * w_norm[:, None], axis=0)
   centered = xy_w - mean_xy
-  cov = (centered * w_norm[:, None]).T @ centered
+  with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+    cov = (centered * w_norm[:, None]).T @ centered
   eigvals, eigvecs = np.linalg.eigh(cov)
   major, yaw_rad = _canonicalize_2d_axis(eigvecs[:, 1], prev_yaw_rad)
   minor = np.array([-major[1], major[0]], dtype=np.float64)
   anisotropy = float(max(eigvals[1], 0.0) / max(eigvals[0], 1e-12))
 
-  proj_major = centered @ major
-  proj_minor = centered @ minor
+  with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+    proj_major = centered @ major
+    proj_minor = centered @ minor
   obb_xy = (
       mean_xy
       + 0.5 * (float(proj_major.min()) + float(proj_major.max())) * major
@@ -254,7 +282,29 @@ def triangulate_matched_points(
     pts2_uv: np.ndarray,
     max_reproj_err_px: float = 2.0,
 ) -> dict[str, Any]:
-  """Triangulates matched 2D points across two calibrated views with reproj gate."""
+  """Triangulates matched 2D points across two calibrated views with reproj gate.
+
+  Note: `t_world_cam1` and `t_world_cam2` use OpenCV pinhole axes (+X right,
+  +Y down, +Z forward; from MJCF use `mp.get_camera_poses_opencv`, never raw
+  `cam_xmat`).
+
+  Args:
+    k1: `(3, 3)` pinhole intrinsic matrix of camera 1.
+    t_world_cam1: `(4, 4)` camera1-to-world transform in OpenCV axes.
+    pts1_uv: `(N, 2)` matching 2D pixel coordinates in view 1.
+    k2: `(3, 3)` pinhole intrinsic matrix of camera 2.
+    t_world_cam2: `(4, 4)` camera2-to-world transform in OpenCV axes.
+    pts2_uv: `(N, 2)` matching 2D pixel coordinates in view 2.
+    max_reproj_err_px: Maximum allowed reprojection error in pixels.
+
+  Returns:
+    Dict containing 'center_3d_m', 'inliers_3d_m', 'major_axis_3d',
+    'anisotropy', and 'num_inliers'.
+
+  Raises:
+    RuntimeError: If no finite or inlier 3D points are recovered.
+    ValueError: If `pts1_uv` and `pts2_uv` are empty or have mismatched shapes.
+  """
   uv1 = np.asarray(pts1_uv, dtype=np.float64).reshape(-1, 2)
   uv2 = np.asarray(pts2_uv, dtype=np.float64).reshape(-1, 2)
   if uv1.shape[0] == 0 or uv1.shape != uv2.shape:

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import importlib
 import json
@@ -43,7 +44,14 @@ from typing import Any
 import check_cameras
 import check_robot
 import discover_hardware
+import fr3_arm_controller
+from fr3_camera_controller import _DictCompatMixin
+from fr3_duo_robot import Fr3DuoRobot
+from fr3_safety import AbortWatcher
+import robotiq_gripper_controller
 from fr3_config import (
+    BASE_WORLD_Z_M,
+    BRACKET_UNDERSIDE_FRONT_X_M,
     DEFAULT_CONFIG_PATH,
     RobotConfig,
     load_robot_config,
@@ -151,6 +159,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
       "--right-ip", type=str, default=None, help="Right arm FCI IP."
   )
   parser.add_argument(
+      "--zed-conf-path",
+      type=str,
+      default=None,
+      help=(
+          "Optional ZED SN<serial>.conf file or settings directory stored on"
+          " cameras.head_stereo.zed_conf_path."
+      ),
+  )
+  parser.add_argument(
       "--base-height-m",
       type=float,
       default=None,
@@ -194,6 +211,33 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
       help="Mark physical cell geometry & fingertip measurements confirmed.",
   )
   parser.add_argument(
+      "--touch-geometry",
+      action="store_true",
+      help=(
+          "Calibrate z_table_m (and optionally table_front_offset_m) via"
+          " read-only FCI joint state + FK while closed gripper(s) rest on"
+          " the tabletop via the FR3 cuff button (zero arm motion)."
+      ),
+  )
+  parser.add_argument(
+      "--touch-arm",
+      choices=("auto", "left", "right", "both"),
+      default="auto",
+      help=(
+          "Which enabled arm(s) rest on the tabletop during"
+          " --touch-geometry (default: auto -> left if enabled else right;"
+          " pass 'both' to average both arms)."
+      ),
+  )
+  parser.add_argument(
+      "--close-grippers",
+      action="store_true",
+      help=(
+          "Activate and close enabled Robotiq grippers before cuff touch"
+          " during --step geometry (skipped under --dry-run / --read-only)."
+      ),
+  )
+  parser.add_argument(
       "--output-dir",
       type=Path,
       default=None,
@@ -235,12 +279,74 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
   return parser.parse_args(argv)
 
 
-def _write_summary(out_dir: Path, summary: dict[str, Any]) -> None:
+@dataclass
+class StepStatus(_DictCompatMixin):
+  """Per-step outcome recorded in `bringup_summary.json`."""
+
+  status: str
+  exit_code: int | None = None
+  error: str | None = None
+  warnings: list[str] = field(default_factory=list)
+  warning: str | None = None
+  read_only: bool | None = None
+  extras: dict[str, Any] = field(default_factory=dict)
+
+  def to_dict(self) -> dict[str, Any]:
+    """Returns a compact JSON-serializable dictionary of step status."""
+    out: dict[str, Any] = {"status": self.status}
+    if self.exit_code is not None:
+      out["exit_code"] = self.exit_code
+    if self.error:
+      out["error"] = self.error
+    if self.warnings:
+      out["warnings"] = list(self.warnings)
+    if self.warning:
+      out["warning"] = self.warning
+    if self.read_only is not None:
+      out["read_only"] = self.read_only
+    out.update(self.extras)
+    return out
+
+
+@dataclass
+class BringupSummary(_DictCompatMixin):
+  """Top-level `bringup_summary.json` schema."""
+
+  timestamp_utc: str
+  mode: str
+  up_to: str | None
+  step: str | None
+  read_only: bool
+  status: str = "in_progress"
+  steps: dict[str, StepStatus | dict[str, Any]] = field(default_factory=dict)
+  artifacts: dict[str, str] = field(default_factory=dict)
+
+  def to_dict(self) -> dict[str, Any]:
+    """Returns a JSON-serializable dictionary of the bring-up summary."""
+    return {
+        "timestamp_utc": self.timestamp_utc,
+        "mode": self.mode,
+        "up_to": self.up_to,
+        "step": self.step,
+        "read_only": self.read_only,
+        "status": self.status,
+        "steps": {
+            k: v.to_dict() if hasattr(v, "to_dict") else v
+            for k, v in self.steps.items()
+        },
+        "artifacts": dict(self.artifacts),
+    }
+
+
+def _write_summary(
+    out_dir: Path, summary: BringupSummary | Mapping[str, Any]
+) -> None:
   try:
     out_dir.mkdir(parents=True, exist_ok=True)
     summary_path = out_dir / "bringup_summary.json"
+    payload = summary.to_dict() if hasattr(summary, "to_dict") else summary
     summary_path.write_text(
-        json.dumps(summary, indent=2) + "\n", encoding="utf-8"
+        json.dumps(payload, indent=2) + "\n", encoding="utf-8"
     )
   except OSError as exc:
     print(
@@ -250,8 +356,8 @@ def _write_summary(out_dir: Path, summary: dict[str, Any]) -> None:
 
 
 def _call_stage(
-    fn: Callable[..., tuple[int, dict[str, Any]]], *args: Any, **kwargs: Any
-) -> tuple[int, dict[str, Any], str | None]:
+    fn: Callable[..., tuple[int, Any]], *args: Any, **kwargs: Any
+) -> tuple[int, Any, str | None]:
   """Calls a stage `run_*` function and traps unexpected runtime errors."""
   try:
     rc, report = fn(*args, **kwargs)
@@ -268,16 +374,17 @@ def _fmt_opt(val: Any) -> Any:
 
 def _fail_step(
     out_dir: Path,
-    summary: dict[str, Any],
+    summary: BringupSummary,
     step_key: str,
     rc: int,
     error: str | None = None,
 ) -> int:
-  summary["status"] = "failed"
-  info: dict[str, Any] = {"status": "failed", "exit_code": rc}
-  if error:
-    info["error"] = error
-  summary["steps"][step_key] = info
+  summary.status = "failed"
+  summary.steps[step_key] = StepStatus(
+      status="failed",
+      exit_code=rc,
+      error=error,
+  )
   _write_summary(out_dir, summary)
   return rc
 
@@ -349,11 +456,11 @@ def _run_env_step(
         f"\n[FAIL] Step 0 environment check failed: missing {missing_required}",
         file=sys.stderr,
     )
-    summary["status"] = "failed"
-    summary["steps"]["env"] = {
-        "status": "failed",
-        "missing_modules": missing_required,
-    }
+    summary.status = "failed"
+    summary.steps["env"] = StepStatus(
+        status="failed",
+        extras={"missing_modules": missing_required},
+    )
     _write_summary(out_dir, summary)
     return 1
 
@@ -384,15 +491,15 @@ def _run_env_step(
     print(
         "\n[FAIL] Step 0 MuJoCo & trajectory pre-check failed.", file=sys.stderr
     )
-    summary["status"] = "failed"
-    step0_info: dict[str, Any] = {
-        "status": "failed",
-        "mjcf_ok": mjcf_err is None,
-        "dry_check_rc": dry_check_rc,
-    }
-    if mjcf_err or dry_check_err:
-      step0_info["error"] = mjcf_err or dry_check_err
-    summary["steps"]["env"] = step0_info
+    summary.status = "failed"
+    summary.steps["env"] = StepStatus(
+        status="failed",
+        error=mjcf_err or dry_check_err,
+        extras={
+            "mjcf_ok": mjcf_err is None,
+            "dry_check_rc": dry_check_rc,
+        },
+    )
     _write_summary(out_dir, summary)
     return 1
 
@@ -400,7 +507,10 @@ def _run_env_step(
       "  [PASS] MuJoCo & dry-run pre-check succeeded"
       " (kinematics & safety gates ok)"
   )
-  summary["steps"]["env"] = {"status": "ok", "menagerie": bool(menagerie_path)}
+  summary.steps["env"] = StepStatus(
+      status="ok",
+      extras={"menagerie": bool(menagerie_path)},
+  )
   return 0
 
 
@@ -456,12 +566,14 @@ def _run_preflight_step(
     cfg.arms.left.ip = str(args.left_ip)
   if args.right_ip:
     cfg.arms.right.ip = str(args.right_ip)
+  if args.zed_conf_path is not None:
+    cfg.cameras.head_stereo.zed_conf_path = str(args.zed_conf_path).strip()
 
   if d_rep:
     if d_rep.get("report_path"):
-      summary["artifacts"]["discovery_report"] = d_rep["report_path"]
+      summary.artifacts["discovery_report"] = d_rep["report_path"]
     elif s1_json.is_file():
-      summary["artifacts"]["discovery_report"] = str(s1_json)
+      summary.artifacts["discovery_report"] = str(s1_json)
     rt_cfg = (d_rep.get("realtime_profile") or {}).get(
         "realtime_config", "unknown"
     )
@@ -499,50 +611,23 @@ def _run_preflight_step(
       for note in notes:
         print(f"    - {note}")
 
-  summary["steps"]["preflight"] = {"status": "ok", "exit_code": 0}
+  summary.steps["preflight"] = StepStatus(status="ok", exit_code=0)
   return 0, cfg
 
 
-_GEOMETRY_PROMPTS: tuple[tuple[str, str, bool], ...] = (
-    (
-        "base_height_m",
-        "  1) base_height_m (floor -> flat center bracket underside) [m]"
-        " (default {val:.4f}): ",
-        False,
-    ),
-    (
-        "table_height_m",
-        "  2) table_height_m (floor -> tabletop, ALOHA 0.750) [m]"
-        " (default {val:.3f}): ",
-        True,
-    ),
-    (
-        "table_front_offset_m",
-        "  3) table_front_offset_m (bracket front lip -> table front edge)"
-        " [m] (default {val:.3f}): ",
-        True,
-    ),
-    (
-        "table_width_m",
-        "  4a) table_width_m (ALOHA 1.220) [m] (default {val:.3f}): ",
-        False,
-    ),
-    (
-        "table_depth_m",
-        "  4b) table_depth_m (ALOHA 0.740) [m] (default {val:.3f}): ",
-        False,
-    ),
-)
-
-
-def _geometry_reference_image_path() -> Path:
-  """Resolves `assets/fr3_duo_dimensions_reference.png` relative to skill."""
-  rel = Path("assets") / "fr3_duo_dimensions_reference.png"
+def _skill_asset_path(filename: str) -> Path:
+  """Resolves `assets/<filename>` relative to the `fr3-duo-control` skill."""
+  rel = Path("assets") / filename
   for base in (os.path.abspath(__file__), Path(__file__).resolve()):
     candidate = Path(base).parents[1] / rel
     if candidate.is_file():
       return candidate
   return Path(__file__).resolve().parents[1] / rel
+
+
+def _geometry_reference_image_path() -> Path:
+  """Resolves `assets/fr3_duo_dimensions_reference.png` relative to skill."""
+  return _skill_asset_path("fr3_duo_dimensions_reference.png")
 
 
 def _validate_geom_value(
@@ -574,93 +659,749 @@ def _extract_geometry_cli_updates(
   return updates, None
 
 
+_DEFAULT_TOUCH_ARM = "auto"
+_ALOHA_TABLE_WIDTH_M = 1.22
+_ALOHA_TABLE_DEPTH_M = 0.74
+_TOUCH_MAX_Z_SPREAD_M = 0.025
+_TOUCH_MAX_ABS_Z_M = 0.15
+_TOUCH_MAX_FK_ERR_M = 0.005
+_ARM_PERSPECTIVE_DESC: dict[str, str] = {
+    "left": "LEFT (+Y, operator's RIGHT facing pedestal)",
+    "right": "RIGHT (-Y, operator's LEFT facing pedestal)",
+}
+
+
+def _is_non_interactive_tty(input_fn: Callable[[str], str]) -> bool:
+  """Returns True when stdin is non-interactive and no test hook is passed."""
+  return input_fn is input and not sys.stdin.isatty()
+
+
+def _save_geometry_if_enabled(
+    cfg: RobotConfig,
+    args: argparse.Namespace,
+    *,
+    write_cfg: bool,
+    confirmed: bool = True,
+) -> None:
+  """Persists `cfg` when writing is enabled, or logs why it stayed in memory."""
+  if write_cfg and args.config is not None:
+    save_robot_config(cfg, args.config)
+    label = "confirmed" if confirmed else "partial (unconfirmed)"
+    print(f"  Saved {label} geometry to {args.config}")
+  elif not args.dry_run:
+    print(
+        "  [INFO] Config file not written (--no-write-config/--read-only);"
+        " calibrated geometry kept in memory."
+    )
+
+
+def _print_human_table_bounds(
+    cfg: RobotConfig, *, touch_mode: bool = False
+) -> None:
+  """Prints operator-readable tabletop bounds, Z, and raw box extents."""
+  table_center, table_half_extents = cfg.table_box_bounds()
+  x_front = BRACKET_UNDERSIDE_FRONT_X_M + float(cfg.table_front_offset_m)
+  x_back = x_front + float(cfg.table_depth_m)
+  y_half = 0.5 * float(cfg.table_width_m)
+  print(
+      f"  -> Computed z_table_m     : {cfg.z_table_m:+.6f} m"
+      f" ({cfg.z_table_m * 1000.0:+.1f} mm vs Duo base)"
+  )
+  if touch_mode:
+    print(
+        f"  -> base_height_m (synth.) : {cfg.base_height_m:.6f} m"
+        f" (for table_height_m={cfg.table_height_m:.3f} m -> z_table_m)"
+    )
+  print(
+      f"  -> table_front_offset_m   : {cfg.table_front_offset_m:.6f} m"
+      f" (x_front={x_front:+.4f} m)"
+  )
+  print(
+      f"  -> Tabletop footprint     : {cfg.table_width_m:.3f} m W"
+      f" (Y [{-y_half:+.3f}, {+y_half:+.3f}]) x {cfg.table_depth_m:.3f} m D"
+      f" (X [{x_front:+.3f}, {x_back:+.3f}])"
+  )
+  print(f"  -> tcp_offset_z_m         : {cfg.tcp_offset_z_m:.3f} m")
+  print(
+      f"  -> Table box bounds       : center={table_center},"
+      f" half_extents={table_half_extents}"
+  )
+
+
 def _print_geometry_summary(cfg: RobotConfig, ref_img: Path) -> None:
   """Prints current physical geometry, derived `z_table_m`, and table box."""
-  table_center, table_half_extents = cfg.table_box_bounds()
   print(f"  Reference diagram : {ref_img}")
   print(
       f"  base_height_m     : {cfg.base_height_m:.6f} m"
       " (floor -> flat center bracket underside)"
   )
   print(f"  table_height_m    : {cfg.table_height_m:.6f} m (floor -> tabletop)")
-  print(
-      f"  table_front_offset: {cfg.table_front_offset_m:.4f} m"
-      " (bracket underside front lip -> table front edge)"
-  )
-  print(
-      f"  table_width/depth : {cfg.table_width_m:.3f} m x"
-      f" {cfg.table_depth_m:.3f} m"
-  )
-  print(f"  tcp_offset_z_m    : {cfg.tcp_offset_z_m:.3f} m")
-  print(f"  Derived z_table_m : {cfg.z_table_m:+.6f} m")
-  print(
-      f"  Table box bounds  : center={table_center},"
-      f" half_extents={table_half_extents}"
-  )
+  _print_human_table_bounds(cfg, touch_mode=False)
   print(f"  geometry_confirmed: {bool(cfg.geometry_confirmed)}")
 
 
-def _prompt_geometry_calibration(
+def _parse_tcp_offset_input(raw: str, default_val: float) -> float:
+  """Parses interactive fingertip offset (`1/stock`, `2/extended`, float)."""
+  token = raw.strip().lower()
+  if not token:
+    return float(default_val)
+  if token in ("1", "stock", "s", "pads", "2f85", "2f-85"):
+    return 0.145
+  if token in ("2", "extended", "ext", "aloha"):
+    return 0.185
+  return _validate_geom_value("tcp_offset_z_m", float(token))
+
+
+def _prompt_tcp_offset(
+    default_val: float,
+    input_fn: Callable[[str], str],
+    *,
+    prefix: str = "5)",
+    closed_note: bool = False,
+) -> float:
+  """Prompts once for Robotiq fingertip Z offset (`1/stock`, `2/extended`)."""
+  if closed_note:
+    print(
+        "  NOTE: Ensure Robotiq gripper(s) are CLOSED before touching the"
+        " tabletop so tcp_offset_z_m matches physical closed tips"
+        " (e.g. 0.185 m closed extended fingers vs shorter open jaws)."
+    )
+  tag = " (CLOSED)" if closed_note else ""
+  raw = input_fn(
+      f"  {prefix} Fingertips{tag}: [1/stock] 2F-85 pads (0.145) |"
+      f" [2/extended] ALOHA (0.185) | float [m] (default {default_val:.3f}): "
+  )
+  return _parse_tcp_offset_input(raw, default_val)
+
+
+def _stop_geometry_step(
+    out_dir: Path, summary: BringupSummary, cfg: RobotConfig
+) -> tuple[int, RobotConfig]:
+  """Records operator-stopped geometry calibration without mutating `cfg`."""
+  print("Geometry calibration stopped; geometry remains unconfirmed.")
+  summary.status = "stopped_by_operator"
+  summary.steps["geometry"] = StepStatus(
+      status="stopped_by_operator",
+      extras={"geometry_confirmed": False},
+  )
+  _write_summary(out_dir, summary)
+  return 0, cfg
+
+
+def _touch_sample_arms(
     cfg: RobotConfig,
-    ref_img: Path,
+    arms: Sequence[str],
+) -> dict[str, dict[str, Any]]:
+  """Samples read-only FCI joint state and FK for `arms` (zero arm motion)."""
+  mj_model, _ = build_fr3_duo_mjcf(cfg)
+  samples: dict[str, dict[str, Any]] = {}
+  for side in arms:
+    arm_cfg = cfg.arms[side]
+    samples[side] = fr3_arm_controller.probe_arm_readonly(
+        side,
+        arm_cfg.ip,
+        mj_model,
+        rest_pose_rad=arm_cfg.rest_pose_rad,
+        tcp_offset_z_m=cfg.tcp_offset_z_m,
+        realtime_cfg_name="kIgnore",
+    )
+  return samples
+
+
+def _resolve_touch_arms(
+    cfg: RobotConfig, touch_arm: str
+) -> tuple[list[str], str | None]:
+  """Resolves enabled arm side(s) requested via `--touch-arm`."""
+  if touch_arm == "auto":
+    for side in ("left", "right"):
+      if cfg.arms[side].enabled:
+        return [side], None
+    return [], "no_enabled_arms_for_touch_geometry"
+  if touch_arm == "both":
+    arms = [side for side in ("left", "right") if cfg.arms[side].enabled]
+    if not arms:
+      return [], "no_enabled_arms_for_touch_geometry"
+    return arms, None
+  if not cfg.arms[touch_arm].enabled:
+    return [], f"touch_arm_{touch_arm}_disabled"
+  return [touch_arm], None
+
+
+def _prompt_optional_geom_float(
+    field_name: str,
+    prompt_str: str,
+    current_val: float,
+    input_fn: Callable[[str], str],
+) -> float:
+  raw = input_fn(prompt_str).strip()
+  if not raw:
+    return float(current_val)
+  return _validate_geom_value(field_name, float(raw))
+
+
+def _prompt_touch_setup(
+    cfg: RobotConfig,
+    args: argparse.Namespace,
     input_fn: Callable[[str], str],
 ) -> tuple[str, RobotConfig, str | None]:
-  """Interactively prompts for physical cell geometry & fingertip offset."""
-  print(
-      "  Measure your floor-mounted setup per reference diagram:\n"
-      f"    {ref_img}\n"
-      "  Press ENTER to accept the default value in parentheses."
-  )
+  """Prompts interactively for closed fingertips and tabletop footprint."""
+  updated = normalize_robot_config(cfg)
   try:
-    updates: dict[str, Any] = {"geometry_confirmed": True}
-    for field_name, tmpl, allow_zero in _GEOMETRY_PROMPTS:
-      default_val = float(getattr(cfg, field_name))
-      raw = input_fn(tmpl.format(val=default_val)).strip()
-      updates[field_name] = (
-          _validate_geom_value(field_name, float(raw), allow_zero=allow_zero)
-          if raw
-          else default_val
+    if args.tcp_offset_z_m is None:
+      updated.tcp_offset_z_m = _prompt_tcp_offset(
+          updated.tcp_offset_z_m, input_fn, prefix="1)", closed_note=True
       )
-    tcp_raw = (
-        input_fn(
-            "  5) Fingertips: [1/stock] 2F-85 pads (0.145) | [2/extended]"
-            f" ALOHA (0.185) | float [m] (default {cfg.tcp_offset_z_m:.3f}): "
+    if args.table_width_m is None and args.table_depth_m is None:
+      preset_raw = (
+          input_fn(
+              "  2) Tabletop footprint: [1/aloha] 1.220 x 0.740 m |"
+              " [2] Custom W x D"
+              f" (default {updated.table_width_m:.3f} x"
+              f" {updated.table_depth_m:.3f}): "
+          )
+          .strip()
+          .lower()
+      )
+      if preset_raw in ("1", "aloha"):
+        updated.table_width_m = _ALOHA_TABLE_WIDTH_M
+        updated.table_depth_m = _ALOHA_TABLE_DEPTH_M
+      elif preset_raw in ("2", "custom"):
+        updated.table_width_m = _prompt_optional_geom_float(
+            "table_width_m",
+            f"     table_width_m [m] (default {updated.table_width_m:.3f}): ",
+            updated.table_width_m,
+            input_fn,
         )
-        .strip()
-        .lower()
-    )
-    if not tcp_raw:
-      updates["tcp_offset_z_m"] = float(cfg.tcp_offset_z_m)
-    elif tcp_raw in ("1", "stock", "s", "pads", "2f85", "2f-85"):
-      updates["tcp_offset_z_m"] = 0.145
-    elif tcp_raw in ("2", "extended", "ext", "aloha"):
-      updates["tcp_offset_z_m"] = 0.185
+        updated.table_depth_m = _prompt_optional_geom_float(
+            "table_depth_m",
+            f"     table_depth_m [m] (default {updated.table_depth_m:.3f}): ",
+            updated.table_depth_m,
+            input_fn,
+        )
+      elif preset_raw:
+        raise ValueError(
+            f"Invalid table footprint choice {preset_raw!r}; expected 1 or 2"
+        )
     else:
-      updates["tcp_offset_z_m"] = _validate_geom_value(
-          "tcp_offset_z_m", float(tcp_raw)
-      )
-
-    candidate = normalize_robot_config({**cfg.to_dict(), **updates})
-    table_center, table_half_extents = candidate.table_box_bounds()
-    print(f"  -> Computed z_table_m : {candidate.z_table_m:+.6f} m")
-    print(
-        f"  -> Table box bounds   : center={table_center},"
-        f" half_extents={table_half_extents}"
-    )
-    print(f"  -> tcp_offset_z_m     : {candidate.tcp_offset_z_m:.3f} m")
-    confirm = (
-        input_fn("  Confirm geometry & fingertip measurements? [y/N]: ")
-        .strip()
-        .lower()
-    )
+      if args.table_width_m is None:
+        updated.table_width_m = _prompt_optional_geom_float(
+            "table_width_m",
+            f"  2) table_width_m [m] (default {updated.table_width_m:.3f}): ",
+            updated.table_width_m,
+            input_fn,
+        )
+      if args.table_depth_m is None:
+        updated.table_depth_m = _prompt_optional_geom_float(
+            "table_depth_m",
+            f"  2) table_depth_m [m] (default {updated.table_depth_m:.3f}): ",
+            updated.table_depth_m,
+            input_fn,
+        )
   except (EOFError, KeyboardInterrupt):
     return "stopped", cfg, "geometry_prompt_aborted"
   except ValueError as exc:
     return "invalid", cfg, str(exc)
+  return "ok", updated, None
 
-  if confirm in ("y", "yes"):
-    return "confirmed", candidate, None
-  return "stopped", cfg, "geometry_confirmation_declined"
+
+def _extract_touch_coords(
+    samples: Mapping[str, Mapping[str, Any]],
+    candidate: RobotConfig,
+    arms_to_probe: Sequence[str],
+) -> tuple[dict[str, list[float]], str | None]:
+  """Validates probed arm connections and extracts finite `[x, y, z]` TCP."""
+  coords: dict[str, list[float]] = {}
+  for side in arms_to_probe:
+    rd = samples.get(side) or {}
+    if not bool(rd.get("connected")):
+      err_detail = rd.get("connection_error") or "unreachable"
+      return (
+          {},
+          f"FR3 {side} arm ({candidate.arms[side].ip}) unreachable during"
+          f" --touch-geometry: {err_detail}",
+      )
+    pos = rd.get("tcp_pos_base_m")
+    if (
+        not isinstance(pos, Sequence)
+        or isinstance(pos, (str, bytes))
+        or len(pos) < 3
+    ):
+      return {}, f"FR3 {side} arm returned invalid tcp_pos_base_m={pos!r}"
+    xyz = [float(pos[0]), float(pos[1]), float(pos[2])]
+    if not all(math.isfinite(v) for v in xyz):
+      return {}, f"FR3 {side} arm returned non-finite tcp_pos_base_m={pos!r}"
+    coords[side] = xyz
+  return coords, None
+
+
+def _collect_touch_sample_warnings(
+    samples: Mapping[str, Mapping[str, Any]],
+    arms_to_probe: Sequence[str],
+) -> list[str]:
+  """Collects live Desk `robot_mode` and FK residual warnings."""
+  warnings: list[str] = []
+  for side in arms_to_probe:
+    rd = samples.get(side) or {}
+    robot_mode = (rd.get("desk_audit") or {}).get("robot_mode")
+    if robot_mode is not None and str(robot_mode) != "kIdle":
+      warnings.append(
+          f"FR3 {side} Desk mode is {robot_mode!r} (expected 'kIdle';"
+          " release the cuff button / clear Desk before sampling)."
+      )
+    fk_err = rd.get("fk_pos_error_m")
+    if (
+        fk_err is not None
+        and math.isfinite(float(fk_err))
+        and float(fk_err) > _TOUCH_MAX_FK_ERR_M
+    ):
+      warnings.append(
+          f"FR3 {side} FK mismatch {float(fk_err) * 1000.0:.2f} mm >"
+          f" {_TOUCH_MAX_FK_ERR_M * 1000.0:.1f} mm (verify closed gripper &"
+          " tcp_offset_z_m)."
+      )
+  return warnings
+
+
+def _compute_touch_geometry(
+    candidate: RobotConfig,
+    coords: Mapping[str, Sequence[float]],
+    *,
+    apply_front_offset: bool,
+) -> tuple[RobotConfig | None, list[str], str | None, str | None]:
+  """Derives tabletop height/front offset and sanity warnings from touch FK."""
+  if "left" in coords and "right" in coords:
+    z_l = float(coords["left"][2])
+    z_r = float(coords["right"][2])
+    z_spread = abs(z_l - z_r)
+    if z_spread > _TOUCH_MAX_Z_SPREAD_M:
+      msg = (
+          f"Left/right sampled Z mismatch {z_spread * 1000.0:.1f} mm >"
+          f" {_TOUCH_MAX_Z_SPREAD_M * 1000.0:.1f} mm"
+          f" (left={z_l:+.5f} m, right={z_r:+.5f} m). One arm may be"
+          " parked; rest both closed grippers on the tabletop or pass"
+          " --touch-arm left / --touch-arm right."
+      )
+      return None, [], f"touch_arm_z_mismatch:{z_spread:.6f}", msg
+
+  xs = [float(v[0]) for v in coords.values()]
+  zs = [float(v[2]) for v in coords.values()]
+  x_meas_m = sum(xs) / len(xs)
+  z_meas_m = sum(zs) / len(zs)
+
+  new_base_height_m = round(
+      float(candidate.table_height_m) + BASE_WORLD_Z_M - z_meas_m, 6
+  )
+  try:
+    _validate_geom_value("base_height_m", new_base_height_m, allow_zero=False)
+  except ValueError as exc:
+    err_msg = f"invalid_touch_base_height: {exc}"
+    return None, [], err_msg, err_msg
+
+  warnings: list[str] = []
+  if abs(z_meas_m) > _TOUCH_MAX_ABS_Z_M:
+    warnings.append(
+        f"Derived z_table_m={z_meas_m:+.4f} m is >"
+        f" {_TOUCH_MAX_ABS_Z_M * 100.0:.0f} cm from Duo base origin;"
+        f" confirm gripper was CLOSED and tcp_offset_z_m="
+        f"{candidate.tcp_offset_z_m:.3f} m is right."
+    )
+
+  new_front_offset_m = float(candidate.table_front_offset_m)
+  if apply_front_offset:
+    if x_meas_m <= BRACKET_UNDERSIDE_FRONT_X_M:
+      warnings.append(
+          f"Sampled X ({x_meas_m:+.4f} m) <= bracket front lip"
+          f" ({BRACKET_UNDERSIDE_FRONT_X_M:+.4f} m); clamping"
+          " table_front_offset_m=0.0 m. Verify tip touched table FRONT edge."
+      )
+    new_front_offset_m = round(
+        max(0.0, x_meas_m - BRACKET_UNDERSIDE_FRONT_X_M), 6
+    )
+
+  calibrated = normalize_robot_config({
+      **candidate.to_dict(),
+      "base_height_m": new_base_height_m,
+      "table_front_offset_m": new_front_offset_m,
+      "geometry_confirmed": True,
+  })
+  return calibrated, warnings, None, None
+
+
+def _sample_touch_with_retry(
+    candidate: RobotConfig,
+    arms_to_probe: Sequence[str],
+    *,
+    auto_yes: bool,
+    prompt_instruction: str,
+    prompt_line: str,
+    input_fn: Callable[[str], str],
+) -> tuple[str, dict[str, list[float]], list[str], str | None]:
+  """Prompts operator to position arm(s), probes FK, and retries on warnings."""
+  while True:
+    if not auto_yes:
+      print(prompt_instruction)
+      try:
+        ans = input_fn(prompt_line).strip().lower()
+      except (EOFError, KeyboardInterrupt):
+        return "stopped", {}, [], "geometry_prompt_aborted"
+      if ans in ("q", "quit"):
+        return "stopped", {}, [], "geometry_prompt_aborted"
+
+    try:
+      samples = _touch_sample_arms(candidate, arms_to_probe)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+      return (
+          "fail",
+          {},
+          [],
+          f"touch_sample_failed: {type(exc).__name__}: {exc}",
+      )
+
+    coords, coord_err = _extract_touch_coords(
+        samples, candidate, arms_to_probe
+    )
+    if coord_err is not None:
+      return "fail", {}, [], coord_err
+
+    for side in arms_to_probe:
+      x_v, y_v, z_v = coords[side]
+      print(
+          f"  Sampled {side:<5s} TCP (base): x={x_v:+.5f} m,"
+          f" y={y_v:+.5f} m, z={z_v:+.5f} m"
+      )
+
+    sample_warnings = _collect_touch_sample_warnings(samples, arms_to_probe)
+    for warn_msg in sample_warnings:
+      print(f"  [WARN] {warn_msg}")
+
+    if sample_warnings and not auto_yes:
+      try:
+        retry_ans = (
+            input_fn(
+                "  Retry sample after releasing cuff / fixing Desk? [Y/n/q]: "
+            )
+            .strip()
+            .lower()
+        )
+      except (EOFError, KeyboardInterrupt):
+        return "stopped", {}, sample_warnings, None
+      if retry_ans in ("q", "quit"):
+        return "stopped", {}, sample_warnings, None
+      if retry_ans in ("", "y", "yes", "r", "retry"):
+        continue
+
+    return "ok", coords, sample_warnings, None
+
+
+def _fail_invalid_geometry(
+    out_dir: Path, summary: dict[str, Any], err_msg: str | None
+) -> int:
+  print(
+      f"\n[FAIL] Invalid geometry input ({err_msg}); geometry remains"
+      " unconfirmed.",
+      file=sys.stderr,
+  )
+  return _fail_step(
+      out_dir, summary, "geometry", 2, f"invalid_geometry_input: {err_msg}"
+  )
+
+
+def _confirm_touch_geometry(
+    out_dir: Path,
+    summary: dict[str, Any],
+    orig_cfg: RobotConfig,
+    *,
+    input_fn: Callable[[str], str],
+) -> tuple[str, int]:
+  """Prompts operator to confirm and save calibrated touch geometry."""
+  try:
+    confirm = input_fn("  Confirm & save? [y/N]: ").strip().lower()
+  except (EOFError, KeyboardInterrupt):
+    confirm = "n"
+  if confirm not in ("y", "yes"):
+    rc, _ = _stop_geometry_step(out_dir, summary, orig_cfg)
+    return "stopped", rc
+  return "ok", 0
+
+
+def _preview_touch_geometry_dry_run(
+    cfg: RobotConfig,
+    candidate: RobotConfig,
+    summary: dict[str, Any],
+    ref_img: Path,
+    touch_gif: Path,
+    touch_arm: str,
+    arms_to_probe: Sequence[str],
+    *,
+    close_grippers: bool = False,
+) -> tuple[int, RobotConfig]:
+  print(
+      "  [DRY-RUN] FR3 cuff touch calibration preview (no FCI sockets"
+      " opened):"
+  )
+  print(f"    touch_arm         : {touch_arm} (arms={arms_to_probe})")
+  print(f"    Touch guide GIF   : {touch_gif}")
+  print(f"    tcp_offset_z_m    : {candidate.tcp_offset_z_m:.3f} m")
+  print(f"    current z_table_m : {candidate.z_table_m:+.6f} m")
+  if close_grippers:
+    print(
+        "    [DRY-RUN] --close-grippers: skipping physical Robotiq"
+        " activation/closing."
+    )
+  _print_geometry_summary(candidate, ref_img)
+  missing = validate_robot_config_complete(cfg)
+  print(
+      "  Dry-run completeness preview missing:"
+      f" {missing or 'NONE (complete)'}"
+  )
+  summary.steps["geometry"] = StepStatus(
+      status="ok",
+      exit_code=0,
+      extras={
+          "touch_geometry": True,
+          "touch_arm": touch_arm,
+          "arms_probed": arms_to_probe,
+          "tcp_offset_z_m": candidate.tcp_offset_z_m,
+          "z_table_m": candidate.z_table_m,
+          "geometry_confirmed": bool(cfg.geometry_confirmed),
+          "close_grippers": bool(close_grippers),
+          "missing_for_live": missing,
+      },
+  )
+  return 0, cfg
+
+
+def _close_enabled_grippers_for_touch(cfg: RobotConfig) -> list[str]:
+  """Activates and closes enabled Robotiq grippers before cuff touch."""
+  closed_arms: list[str] = []
+  for side in ("left", "right"):
+    arm_cfg = cfg.arms[side]
+    if not arm_cfg.enabled or not arm_cfg.gripper_port:
+      continue
+    with robotiq_gripper_controller.RobotiqGripper(
+        port=arm_cfg.gripper_port, dry_run=False
+    ) as gripper:
+      gripper.activate()
+      st = gripper.move_normalized(1.0, wait=True)
+    print(
+        f"  Closed {side} Robotiq gripper ({arm_cfg.gripper_port}):"
+        f" ratio={st.position_ratio:.3f}, gOBJ={st.gOBJ}"
+    )
+    closed_arms.append(side)
+  if not closed_arms:
+    raise RuntimeError(
+        "No enabled Robotiq gripper_port configured for --close-grippers."
+    )
+  return closed_arms
+
+
+def _run_touch_geometry_step(
+    cfg: RobotConfig,
+    args: argparse.Namespace,
+    out_dir: Path,
+    summary: dict[str, Any],
+    ref_img: Path,
+    *,
+    effective_dry_run: bool,
+    is_read_only: bool,
+    write_cfg: bool,
+    input_fn: Callable[[str], str],
+) -> tuple[int, RobotConfig]:
+  """Runs FR3 cuff hand-guiding zero-motion FK tabletop calibration."""
+  touch_arm = str(getattr(args, "touch_arm", None) or _DEFAULT_TOUCH_ARM)
+  arms_to_probe, arm_err = _resolve_touch_arms(cfg, touch_arm)
+  if arm_err is not None:
+    print(f"\n[FAIL] {arm_err}", file=sys.stderr)
+    return _fail_step(out_dir, summary, "geometry", 2, arm_err), cfg
+
+  if (
+      not effective_dry_run
+      and not args.yes
+      and _is_non_interactive_tty(input_fn)
+  ):
+    print(
+        "[FAIL] --touch-geometry requires an interactive TTY or --yes.",
+        file=sys.stderr,
+    )
+    return _fail_step(
+        out_dir, summary, "geometry", 2, "non_interactive_without_yes"
+    ), cfg
+
+  candidate = cfg
+  touch_gif = _skill_asset_path("cuff_touch_explainer.gif")
+  if not effective_dry_run and not args.yes:
+    print(f"  Touch guide GIF   : {touch_gif}")
+    print(f"  Reference diagram : {ref_img}")
+    setup_status, candidate, setup_err = _prompt_touch_setup(
+        cfg, args, input_fn
+    )
+    if setup_status == "invalid":
+      return _fail_invalid_geometry(out_dir, summary, setup_err), cfg
+    if setup_status == "stopped":
+      return _stop_geometry_step(out_dir, summary, cfg)
+
+  if effective_dry_run:
+    return _preview_touch_geometry_dry_run(
+        cfg,
+        candidate,
+        summary,
+        ref_img,
+        touch_gif,
+        touch_arm,
+        arms_to_probe,
+        close_grippers=bool(getattr(args, "close_grippers", False)),
+    )
+
+  if getattr(args, "close_grippers", False):
+    if is_read_only:
+      print(
+          "  [READ-ONLY] Skipping physical Robotiq activation/closing"
+          " (--close-grippers)."
+      )
+    else:
+      try:
+        _close_enabled_grippers_for_touch(candidate)
+      except Exception as exc:  # pylint: disable=broad-exception-caught
+        err_msg = f"close_grippers_failed: {exc}"
+        print(f"\n[FAIL] {err_msg}", file=sys.stderr)
+        return _fail_step(out_dir, summary, "geometry", 2, err_msg), cfg
+
+  arms_label = ", ".join(
+      _ARM_PERSPECTIVE_DESC.get(s, s) for s in arms_to_probe
+  )
+  apply_front_offset = args.table_front_offset_m is None
+  prompt_line = "  and press ENTER to sample FCI FK ('q' = quit): "
+  sample_status, coords, sample_warnings, sample_err = (
+      _sample_touch_with_retry(
+          candidate,
+          arms_to_probe,
+          auto_yes=bool(args.yes),
+          prompt_instruction=(
+              f"  Hold the {arms_label} FR3 cuff hand-guiding button, rest"
+              " CLOSED fingertip(s) on the table FRONT EDGE, release the cuff"
+              " button so Desk returns to Idle (zero software motion),"
+          ),
+          prompt_line=prompt_line,
+          input_fn=input_fn,
+      )
+  )
+  if sample_status == "stopped":
+    return _stop_geometry_step(out_dir, summary, cfg)
+  if sample_status != "ok":
+    print(f"\n[FAIL] {sample_err}", file=sys.stderr)
+    return _fail_step(out_dir, summary, "geometry", 2, sample_err), cfg
+
+  calibrated, sanity_warnings, calc_code, calc_msg = _compute_touch_geometry(
+      candidate,
+      coords,
+      apply_front_offset=apply_front_offset,
+  )
+  if calibrated is None:
+    print(f"\n[FAIL] {calc_msg}", file=sys.stderr)
+    return _fail_step(out_dir, summary, "geometry", 2, calc_code), cfg
+
+  all_warnings = [*sample_warnings, *sanity_warnings]
+  for warn_msg in sanity_warnings:
+    print(f"  [WARN] {warn_msg}")
+
+  _print_human_table_bounds(calibrated, touch_mode=True)
+
+  if not args.yes:
+    c_outcome, c_rc = _confirm_touch_geometry(
+        out_dir,
+        summary,
+        cfg,
+        input_fn=input_fn,
+    )
+    if c_outcome != "ok":
+      return c_rc, cfg
+
+  cfg = calibrated
+  _save_geometry_if_enabled(cfg, args, write_cfg=write_cfg, confirmed=True)
+  summary.steps["geometry"] = StepStatus(
+      status="ok",
+      exit_code=0,
+      warnings=all_warnings,
+      read_only=True if is_read_only else None,
+      extras={
+          "touch_geometry": True,
+          "touch_arm": touch_arm,
+          "arms_probed": arms_to_probe,
+          "geometry_confirmed": True,
+          "z_table_m": cfg.z_table_m,
+          "table_front_offset_m": cfg.table_front_offset_m,
+          "table_width_m": cfg.table_width_m,
+          "table_depth_m": cfg.table_depth_m,
+          "tcp_offset_z_m": cfg.tcp_offset_z_m,
+      },
+  )
+  return 0, cfg
+
+
+def _record_non_interactive_geometry(
+    cfg: RobotConfig,
+    args: argparse.Namespace,
+    out_dir: Path,
+    summary: dict[str, Any],
+    ref_img: Path,
+    *,
+    has_cli_updates: bool,
+    confirmed_via_cli: bool,
+    effective_dry_run: bool,
+    is_read_only: bool,
+    write_cfg: bool,
+) -> tuple[int, RobotConfig]:
+  """Summarizes and optionally saves geometry when prompting is skipped."""
+  _print_geometry_summary(cfg, ref_img)
+  step_entry = StepStatus(
+      status="ok",
+      exit_code=0,
+      extras={
+          "geometry_confirmed": bool(cfg.geometry_confirmed),
+          "z_table_m": cfg.z_table_m,
+      },
+  )
+  if has_cli_updates or confirmed_via_cli:
+    _save_geometry_if_enabled(
+        cfg,
+        args,
+        write_cfg=write_cfg,
+        confirmed=bool(cfg.geometry_confirmed),
+    )
+  elif effective_dry_run:
+    missing = validate_robot_config_complete(cfg)
+    print(
+        "  Dry-run completeness preview missing:"
+        f" {missing or 'NONE (complete)'}"
+    )
+    if not confirmed_via_cli:
+      step_entry.extras["missing_for_live"] = missing
+  elif cfg.geometry_confirmed:
+    print("  [PASS] Cell geometry & fingertip dimensions already confirmed.")
+  elif is_read_only or args.no_write_config:
+    print(
+        "  [WARN] geometry_confirmed is False (skipping interactive prompt in"
+        " read-only/--no-write-config mode). Run '--step geometry' or pass"
+        " explicit measurement flags + '--confirm-geometry' before live"
+        " actuation."
+    )
+    step_entry.read_only = is_read_only
+  elif args.yes:
+    print(
+        "  [WARN] geometry_confirmed is False; --yes will NOT auto-confirm"
+        " unverified default dimensions. Run '--step geometry' interactively"
+        " or pass explicit measurement flags + '--confirm-geometry'."
+    )
+    step_entry.warning = "geometry_unconfirmed_with_yes"
+  else:
+    print(
+        "  [WARN] geometry_confirmed is False and stdin is not interactive."
+        " Run '--step geometry' in an interactive TTY or pass explicit"
+        " measurement flags + '--confirm-geometry'."
+    )
+    step_entry.warning = "geometry_unconfirmed_non_tty"
+  summary.steps["geometry"] = step_entry
+  return 0, cfg
 
 
 def _run_geometry_step(
@@ -682,122 +1423,102 @@ def _run_geometry_step(
     if cli_err is not None:
       print(f"\n[FAIL] Invalid geometry CLI flag: {cli_err}", file=sys.stderr)
       return _fail_step(out_dir, summary, "geometry", 2, cli_err), cfg
+    if updates:
+      cfg = normalize_robot_config({**cfg.to_dict(), **updates})
   else:
     updates = cli_updates
+
+  write_cfg = (
+      not effective_dry_run and not args.no_write_config and not is_read_only
+  )
+  if getattr(args, "touch_geometry", False):
+    return _run_touch_geometry_step(
+        cfg,
+        args,
+        out_dir,
+        summary,
+        ref_img,
+        effective_dry_run=effective_dry_run,
+        is_read_only=is_read_only,
+        write_cfg=write_cfg,
+        input_fn=input_fn,
+    )
 
   confirmed_via_cli = bool(args.confirm_geometry) or (
       len(updates) == len(_GEOMETRY_CLI_ALLOW_ZERO)
   )
-  write_cfg = (
-      not effective_dry_run and not args.no_write_config and not is_read_only
-  )
-
-  if updates or confirmed_via_cli:
-    cfg = normalize_robot_config({
-        **cfg.to_dict(),
-        **updates,
-        "geometry_confirmed": bool(cfg.geometry_confirmed) or confirmed_via_cli,
-    })
+  if confirmed_via_cli:
+    cfg = normalize_robot_config({**cfg.to_dict(), "geometry_confirmed": True})
 
   if (
       confirmed_via_cli
       or effective_dry_run
-      or (cfg.geometry_confirmed and args.step != "geometry")
       or is_read_only
       or args.no_write_config
       or args.yes
-      or (input_fn is input and not sys.stdin.isatty())
+      or _is_non_interactive_tty(input_fn)
   ):
-    _print_geometry_summary(cfg, ref_img)
-    step_entry: dict[str, Any] = {
-        "status": "ok",
-        "exit_code": 0,
-        "geometry_confirmed": bool(cfg.geometry_confirmed),
-        "z_table_m": cfg.z_table_m,
-    }
-    if (updates or confirmed_via_cli) and write_cfg and args.config is not None:
-      save_robot_config(cfg, args.config)
-      if cfg.geometry_confirmed:
-        print(f"  Saved confirmed geometry to {args.config}")
-      else:
-        print(
-            f"  Saved partial geometry updates (unconfirmed) to {args.config}"
-        )
-    elif effective_dry_run:
-      missing = validate_robot_config_complete(cfg)
-      print(
-          "  Dry-run completeness preview missing:"
-          f" {missing or 'NONE (complete)'}"
-      )
-      if not confirmed_via_cli:
-        step_entry["missing_for_live"] = missing
-    elif cfg.geometry_confirmed:
-      print("  [PASS] Cell geometry & fingertip dimensions already confirmed.")
-    elif is_read_only or args.no_write_config:
-      print(
-          "  [WARN] geometry_confirmed is False (skipping interactive prompt in"
-          " read-only/--no-write-config mode). Run '--step geometry' or pass"
-          " explicit measurement flags + '--confirm-geometry' before live"
-          " actuation."
-      )
-      step_entry["read_only"] = is_read_only
-    elif args.yes:
-      print(
-          "  [WARN] geometry_confirmed is False; --yes will NOT auto-confirm"
-          " unverified default dimensions. Run '--step geometry' interactively"
-          " or pass explicit measurement flags + '--confirm-geometry'."
-      )
-      step_entry["warning"] = "geometry_unconfirmed_with_yes"
-    else:
-      print(
-          "  [WARN] geometry_confirmed is False and stdin is not interactive."
-          " Run '--step geometry' in an interactive TTY or pass explicit"
-          " measurement flags + '--confirm-geometry'."
-      )
-      step_entry["warning"] = "geometry_unconfirmed_non_tty"
-    summary["steps"]["geometry"] = step_entry
-    return 0, cfg
-
-  outcome, new_cfg, prompt_err = _prompt_geometry_calibration(
-      cfg, ref_img, input_fn
-  )
-  if outcome == "invalid":
-    print(
-        f"\n[FAIL] Invalid geometry input ({prompt_err}); geometry remains"
-        " unconfirmed.",
-        file=sys.stderr,
+    return _record_non_interactive_geometry(
+        cfg,
+        args,
+        out_dir,
+        summary,
+        ref_img,
+        has_cli_updates=bool(updates),
+        confirmed_via_cli=confirmed_via_cli,
+        effective_dry_run=effective_dry_run,
+        is_read_only=is_read_only,
+        write_cfg=write_cfg,
     )
-    return _fail_step(
-        out_dir, summary, "geometry", 2, f"invalid_geometry_input: {prompt_err}"
-    ), cfg
-  if outcome == "stopped":
-    print("Geometry calibration stopped; geometry remains unconfirmed.")
-    summary["status"] = "stopped_by_operator"
-    summary["steps"]["geometry"] = {
-        "status": "stopped_by_operator",
-        "geometry_confirmed": False,
-    }
-    _write_summary(out_dir, summary)
-    return 0, cfg
 
-  cfg = new_cfg
-  if write_cfg and args.config is not None:
-    save_robot_config(cfg, args.config)
-    print(f"  Saved confirmed geometry to {args.config}")
-  summary["steps"]["geometry"] = {
-      "status": "ok",
-      "exit_code": 0,
-      "geometry_confirmed": True,
-      "z_table_m": cfg.z_table_m,
-  }
-  return 0, cfg
+  config_on_disk = args.config is not None and args.config.is_file()
+  if config_on_disk and cfg.geometry_confirmed and not updates:
+    _print_geometry_summary(cfg, ref_img)
+    try:
+      reuse_raw = (
+          input_fn(
+              "  Existing config found: [1] Reuse existing config |"
+              " [2] Recalibrate (start fresh) [1]: "
+          )
+          .strip()
+          .lower()
+      )
+    except (EOFError, KeyboardInterrupt):
+      return _stop_geometry_step(out_dir, summary, cfg)
+    if reuse_raw in ("", "1", "reuse"):
+      print("  Reusing existing calibrated config.")
+      summary.steps["geometry"] = StepStatus(
+          status="ok",
+          exit_code=0,
+          extras={
+              "geometry_confirmed": True,
+              "z_table_m": cfg.z_table_m,
+              "reused_existing": True,
+          },
+      )
+      return 0, cfg
+    if reuse_raw not in ("2", "recalibrate", "fresh"):
+      err_msg = f"Invalid config choice {reuse_raw!r}; expected 1 or 2"
+      return _fail_invalid_geometry(out_dir, summary, err_msg), cfg
+
+  return _run_touch_geometry_step(
+      cfg,
+      args,
+      out_dir,
+      summary,
+      ref_img,
+      effective_dry_run=effective_dry_run,
+      is_read_only=is_read_only,
+      write_cfg=write_cfg,
+      input_fn=input_fn,
+  )
 
 
 def _run_cameras_step(
     cfg: RobotConfig,
     args: argparse.Namespace,
     out_dir: Path,
-    summary: dict[str, Any],
+    summary: BringupSummary,
     *,
     effective_dry_run: bool,
 ) -> int:
@@ -825,14 +1546,14 @@ def _run_cameras_step(
       ("fk_projection_overlay_path", "fk_projection_overlay_2x2", "FK Overlay"),
   ):
     if c_rep.get(key):
-      summary["artifacts"][art_key] = c_rep[key]
+      summary.artifacts[art_key] = c_rep[key]
       print(f"  {label:<14}: {c_rep[key]}")
   mp4_path = (c_rep.get("recording") or {}).get("mp4_path")
   if mp4_path:
-    summary["artifacts"]["cameras_recording_mp4"] = mp4_path
+    summary.artifacts["cameras_recording_mp4"] = mp4_path
     print(f"  MP4 Recording : {mp4_path}")
 
-  summary["steps"]["cameras"] = {"status": "ok", "exit_code": 0}
+  summary.steps["cameras"] = StepStatus(status="ok", exit_code=0)
   return 0
 
 
@@ -858,7 +1579,7 @@ def _confirm_actuation(
       )
     return "run", 0
 
-  if input_fn is input and not sys.stdin.isatty():
+  if _is_non_interactive_tty(input_fn):
     print(
         f"[FAIL] Physical actuation for '{step_key}' requires an"
         " interactive TTY or --yes.",
@@ -887,7 +1608,7 @@ def _confirm_actuation(
 
   if ans in ("s", "skip"):
     print(f"Skipping '{step_key}'.")
-    summary["steps"][step_key] = {"status": "skipped"}
+    summary.steps[step_key] = StepStatus(status="skipped")
     return "skip", 0
   if ans not in ("y", "yes"):
     msg = (
@@ -896,8 +1617,8 @@ def _confirm_actuation(
         else f"Unrecognized response {ans!r}; stopping bring-up."
     )
     print(msg)
-    summary["status"] = "stopped_by_operator"
-    summary["steps"][step_key] = {"status": "stopped_by_operator"}
+    summary.status = "stopped_by_operator"
+    summary.steps[step_key] = StepStatus(status="stopped_by_operator")
     _write_summary(out_dir, summary)
     return "stop", 0
   return "run", 0
@@ -908,7 +1629,7 @@ def _validate_actuation_result(
     sub_rep: Mapping[str, Any],
     sub_dir: Path,
     out_dir: Path,
-    summary: dict[str, Any],
+    summary: BringupSummary,
 ) -> tuple[str, int]:
   """Checks post-step success/abort invariants for live actuation steps."""
   if step_key == "gripper":
@@ -937,11 +1658,11 @@ def _validate_actuation_result(
         for arm_res in (sub_rep.get("results") or {}).values()
     ):
       print(f"Bring-up stopped by operator abort during '{step_key}'.")
-      summary["status"] = "stopped_by_operator"
-      summary["steps"][step_key] = {
-          "status": "stopped_by_operator",
-          "aborted": True,
-      }
+      summary.status = "stopped_by_operator"
+      summary.steps[step_key] = StepStatus(
+          status="stopped_by_operator",
+          extras={"aborted": True},
+      )
       _write_summary(out_dir, summary)
       return "stop", 0
     return "ok", 0
@@ -979,18 +1700,70 @@ def _validate_actuation_result(
         sub_dir / "stage4_hello_world.mp4"
     )
     if Path(mp4_cand).is_file():
-      summary["artifacts"]["stage4_hello_world_mp4"] = str(mp4_cand)
+      summary.artifacts["stage4_hello_world_mp4"] = str(mp4_cand)
       print(f"  Stage 4 MP4 Recording: {mp4_cand}")
     if bool(sub_rep.get("aborted", False)):
       print("Bring-up stopped by operator abort during 'hello-world'.")
-      summary["status"] = "stopped_by_operator"
-      summary["steps"][step_key] = {
-          "status": "stopped_by_operator",
-          "aborted": True,
-      }
+      summary.status = "stopped_by_operator"
+      summary.steps[step_key] = StepStatus(
+          status="stopped_by_operator",
+          extras={"aborted": True},
+      )
       _write_summary(out_dir, summary)
       return "stop", 0
   return "ok", 0
+
+
+def _run_home_step(
+    cfg: RobotConfig,
+    *,
+    realtime: str,
+    output_dir: Path,
+) -> tuple[int, dict[str, Any], str | None]:
+  """Runs live bimanual homing with upward-only initial tabletop lift-off."""
+  try:
+    with Fr3DuoRobot(
+        cfg, mode="hardware", dry_run=False, realtime_mode=realtime
+    ) as robot:
+      with AbortWatcher() as watcher:
+        move_res = robot.home(
+            abort_watcher=watcher,
+            allow_initial_table_lift=True,
+        )
+  except Exception as exc:  # pylint: disable=broad-exception-caught
+    return 1, {}, f"{type(exc).__name__}: {exc}"
+
+  res_dict = (
+      move_res.to_dict() if hasattr(move_res, "to_dict") else dict(move_res)
+  )
+  report = {
+      "stage": "stage3_home",
+      "mode": "hardware",
+      "allow_initial_table_lift": True,
+      "results": {
+          "left": {
+              "home": {
+                  "ok": bool(res_dict.get("ok", True)),
+                  "aborted": bool(res_dict.get("aborted", False)),
+                  "final_q_rad": list(res_dict.get("final_left_q_rad") or []),
+              }
+          },
+          "right": {
+              "home": {
+                  "ok": bool(res_dict.get("ok", True)),
+                  "aborted": bool(res_dict.get("aborted", False)),
+                  "final_q_rad": list(res_dict.get("final_right_q_rad") or []),
+              }
+          },
+      },
+  }
+  (output_dir / "check_robot_home.json").write_text(
+      json.dumps(report, indent=2) + "\n", encoding="utf-8"
+  )
+  ok_or_aborted = bool(res_dict.get("ok", True)) or bool(
+      res_dict.get("aborted", False)
+  )
+  return (0 if ok_or_aborted else 1), report, None
 
 
 def main(
@@ -1021,16 +1794,13 @@ def main(
   target_desc = (
       f"step={args.step}" if args.step is not None else f"up_to={args.up_to}"
   )
-  summary: dict[str, Any] = {
-      "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-      "mode": mode_label,
-      "up_to": None if args.step is not None else args.up_to,
-      "step": args.step,
-      "read_only": is_read_only,
-      "status": "in_progress",
-      "steps": {},
-      "artifacts": {},
-  }
+  summary = BringupSummary(
+      timestamp_utc=datetime.now(timezone.utc).isoformat(),
+      mode=mode_label,
+      up_to=None if args.step is not None else args.up_to,
+      step=args.step,
+      read_only=is_read_only,
+  )
 
   print(
       f"=== Franka Research 3 Duo Bring-Up (mode={mode_label},"
@@ -1044,6 +1814,8 @@ def main(
       cfg.arms.left.ip = str(args.left_ip)
     if args.right_ip:
       cfg.arms.right.ip = str(args.right_ip)
+    if args.zed_conf_path is not None:
+      cfg.cameras.head_stereo.zed_conf_path = str(args.zed_conf_path).strip()
   except (OSError, ValueError, TypeError) as exc:
     err_msg = f"{type(exc).__name__}: {exc}"
     print(f"\n[FAIL] Invalid robot configuration: {err_msg}", file=sys.stderr)
@@ -1093,7 +1865,7 @@ def main(
         input_fn=input_fn,
         cli_updates=cli_geom_updates,
     )
-    if rc_geom != 0 or summary.get("status") == "stopped_by_operator":
+    if rc_geom != 0 or summary.status == "stopped_by_operator":
       return rc_geom
   elif cli_geom_updates or args.confirm_geometry:
     confirmed_via_cli = bool(args.confirm_geometry) or (
@@ -1164,15 +1936,20 @@ def main(
 
     sub_dir = out_dir / f"step3_{step_key}"
     sub_dir.mkdir(parents=True, exist_ok=True)
-    rc, sub_rep, sub_err = _call_stage(
-        check_robot.run_robot_check,
-        cfg,
-        mode=step_key,
-        read_only=is_read_only,
-        dry_run=effective_dry_run,
-        realtime=args.realtime,
-        output_dir=sub_dir,
-    )
+    if step_key == "home" and will_actuate:
+      rc, sub_rep, sub_err = _run_home_step(
+          cfg, realtime=args.realtime, output_dir=sub_dir
+      )
+    else:
+      rc, sub_rep, sub_err = _call_stage(
+          check_robot.run_robot_check,
+          cfg,
+          mode=step_key,
+          read_only=is_read_only,
+          dry_run=effective_dry_run,
+          realtime=args.realtime,
+          output_dir=sub_dir,
+      )
     if rc != 0:
       print(
           f"\n[FAIL] {desc} returned non-zero exit code {rc}.", file=sys.stderr
@@ -1186,12 +1963,13 @@ def main(
       if outcome in ("fail", "stop"):
         return out_rc
 
-    step_entry: dict[str, Any] = {"status": "ok", "exit_code": 0}
-    if is_read_only:
-      step_entry["read_only"] = True
-    summary["steps"][step_key] = step_entry
+    summary.steps[step_key] = StepStatus(
+        status="ok",
+        exit_code=0,
+        read_only=True if is_read_only else None,
+    )
 
-  summary["status"] = "ok"
+  summary.status = "ok"
   _write_summary(out_dir, summary)
 
   print("\n=======================================================")
@@ -1199,7 +1977,7 @@ def main(
   print(f"  Mode     : {mode_label}")
   print(f"  Target   : {target_desc}")
   print(f"  Summary  : {out_dir / 'bringup_summary.json'}")
-  for art_name, art_p in summary.get("artifacts", {}).items():
+  for art_name, art_p in summary.artifacts.items():
     print(f"  Artifact : [{art_name}] -> {art_p}")
   print("=======================================================")
   return 0

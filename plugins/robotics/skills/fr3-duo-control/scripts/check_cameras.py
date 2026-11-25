@@ -17,11 +17,11 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 from pathlib import Path
 import sys
-import time
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -31,20 +31,62 @@ from fr3_camera_controller import (
     CANONICAL_CAMERAS,
     CameraFrame,
     Fr3DuoCameraController,
+    apply_rectified_camera_calibration,
     render_contact_sheet,
+    scale_camera_calibration,
 )
 from fr3_config import (
     RobotConfig,
     normalize_robot_config,
-    open_mp4_writer,
     resolve_stage_output_dir,
     save_rgb_png,
 )
 import fr3_kinematics
 import fr3_mjcf
+from fr3_recording import _DictCompatMixin, record_mosaic_clip
 
 if TYPE_CHECKING:
   import fr3_duo_robot
+
+
+@dataclass
+class CameraCheckReport(_DictCompatMixin):
+  """Structured Stage 2 camera check report written to JSON."""
+
+  timestamp_utc: str
+  stage: str
+  mode: str
+  dry_run: bool
+  freshness: Any
+  contact_sheet_shape: list[int]
+  contact_sheet_path: str | None
+  fk_projection_overlay_path: str | None
+  recording: dict[str, Any] | None
+  report_path: str | None = None
+
+  def to_dict(self) -> dict[str, Any]:
+    """Converts the camera check report to a JSON-serializable dict."""
+    freshness_val = (
+        self.freshness.to_dict()
+        if hasattr(self.freshness, "to_dict")
+        else self.freshness
+    )
+    out: dict[str, Any] = {
+        "timestamp_utc": self.timestamp_utc,
+        "stage": self.stage,
+        "mode": self.mode,
+        "dry_run": self.dry_run,
+        "freshness": freshness_val,
+        "contact_sheet_shape": list(self.contact_sheet_shape),
+        "contact_sheet_path": self.contact_sheet_path,
+        "fk_projection_overlay_path": self.fk_projection_overlay_path,
+        "recording": (
+            dict(self.recording) if self.recording is not None else None
+        ),
+    }
+    if self.report_path is not None:
+      out["report_path"] = self.report_path
+    return out
 
 
 def _record_mosaic_mp4(
@@ -56,57 +98,21 @@ def _record_mosaic_mp4(
     target_fps: float,
 ) -> dict[str, Any]:
   """Records 2x2 contact-sheet frames to MP4 and per-frame logs to JSONL."""
-  mp4_path.parent.mkdir(parents=True, exist_ok=True)
-  jsonl_path.parent.mkdir(parents=True, exist_ok=True)
-
-  first_batch = rig.capture_all()
-  first_mosaic = render_contact_sheet(first_batch)
-  h, w = int(first_mosaic.shape[0]), int(first_mosaic.shape[1])
-
-  writer = open_mp4_writer(mp4_path, width=w, height=h, fps=target_fps)
-
-  total_frames = max(
-      2, int(round(max(0.1, float(duration_s)) * float(target_fps)))
+  summary = record_mosaic_clip(
+      rig.capture_all,
+      mp4_path,
+      jsonl_path,
+      duration_s=duration_s,
+      fps=target_fps,
   )
-  dt_s = 1.0 / max(1.0, float(target_fps))
-  frames_written = 0
-
-  try:
-    with jsonl_path.open("w", encoding="utf-8") as log_f:
-      for idx in range(total_frames):
-        t0 = time.monotonic()
-        batch: dict[str, CameraFrame] = (
-            first_batch if idx == 0 else rig.capture_all()
-        )
-        mosaic_rgb = first_mosaic if idx == 0 else render_contact_sheet(batch)
-        writer.write(np.ascontiguousarray(mosaic_rgb[:, :, ::-1]))
-        frames_written += 1
-        event = {
-            "frame_index": idx,
-            "captured_monotonic_s": round(t0, 6),
-            "streams": {
-                name: {
-                    "timestamp_s": round(float(frm.timestamp_s), 6),
-                    "brightness_mean": round(float(frm.brightness_mean), 2),
-                }
-                for name, frm in batch.items()
-            },
-        }
-        log_f.write(json.dumps(event) + "\n")
-        elapsed = time.monotonic() - t0
-        if idx + 1 < total_frames and dt_s > elapsed:
-          time.sleep(min(0.05, dt_s - elapsed))
-  finally:
-    writer.release()
-
   if not mp4_path.is_file() or mp4_path.stat().st_size == 0:
     raise RuntimeError(f"Failed to encode valid MP4 video at {mp4_path}")
 
   return {
-      "mp4_path": str(mp4_path),
-      "jsonl_path": str(jsonl_path),
-      "frames_written": frames_written,
-      "resolution": [w, h],
+      "mp4_path": summary.mp4_path or str(mp4_path),
+      "jsonl_path": summary.jsonl_path or str(jsonl_path),
+      "frames_written": int(summary.frame_count),
+      "resolution": list(summary.resolution),
   }
 
 
@@ -116,6 +122,7 @@ def _render_fk_overlay(
     fk_file: Path,
     *,
     realtime: str,
+    rectified_calibration: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> str | None:
   """Projects left/right pinch TCPs onto camera frames and writes mosaic."""
   try:
@@ -128,6 +135,7 @@ def _render_fk_overlay(
     cal = fr3_kinematics.get_camera_calibration_opencv(
         mj_model, left_q, right_q
     )
+    apply_rectified_camera_calibration(cal, rectified_calibration)
     p_left, _ = fr3_kinematics.compute_arm_fk(mj_model, "left", left_q)
     p_right, _ = fr3_kinematics.compute_arm_fk(mj_model, "right", right_q)
     pinch_sites = {"L pinch": p_left, "R pinch": p_right}
@@ -144,17 +152,15 @@ def _render_fk_overlay(
       tile = frm.rgb.copy()
       h_tile, w_tile = tile.shape[:2]
       if c_name in cal:
-        k_mat = np.array(cal[c_name]["K"], dtype=np.float64, copy=True)
-        cal_w = int(cal[c_name].get("width", w_tile))
-        cal_h = int(cal[c_name].get("height", h_tile))
-        if cal_w > 0 and cal_h > 0 and (w_tile != cal_w or h_tile != cal_h):
-          sx = float(w_tile) / float(cal_w)
-          sy = float(h_tile) / float(cal_h)
-          k_mat[0, 0] *= sx
-          k_mat[0, 2] *= sx
-          k_mat[1, 1] *= sy
-          k_mat[1, 2] *= sy
-        t_base_cam = cal[c_name]["T_base_cam"]
+        cam_cal = cal[c_name]
+        scale_camera_calibration(cam_cal, w_tile, h_tile)
+        k_val = cam_cal["K"] if isinstance(cam_cal, Mapping) else cam_cal.K
+        k_mat = np.asarray(k_val, dtype=np.float64)
+        t_base_cam = (
+            cam_cal["T_base_cam"]
+            if isinstance(cam_cal, Mapping)
+            else cam_cal.T_base_cam
+        )
         for label, p_base in pinch_sites.items():
           (u, v), z_depth = fr3_kinematics.project_base_points_opencv(
               p_base, k_mat, t_base_cam
@@ -204,7 +210,7 @@ def run_camera_check(
     dry_run: bool = False,
     realtime: str = "auto",
     sim_robot: fr3_duo_robot.Fr3DuoRobot | None = None,
-) -> tuple[int, dict[str, Any]]:
+) -> tuple[int, CameraCheckReport]:
   """Runs Stage 2 4-camera freshness check, contact sheet, and MP4 recording."""
   cfg = normalize_robot_config(config)
   effective_dry_run = bool(dry_run)
@@ -246,11 +252,14 @@ def run_camera_check(
       contact_sheet_path = str(sheet_file)
 
       if not effective_dry_run:
+        rect_getter = getattr(rig, "get_rectified_calibration", None)
+        rect_cal = rect_getter() if callable(rect_getter) else None
         fk_overlay_path = _render_fk_overlay(
             cfg,
             snapshot,
             base_dir / "fk_projection_overlay_2x2.png",
             realtime=realtime,
+            rectified_calibration=rect_cal,
         )
 
       if save_references:
@@ -271,17 +280,17 @@ def run_camera_check(
       )
 
   mode_label = "dry_run" if effective_dry_run else "hardware"
-  report: dict[str, Any] = {
-      "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-      "stage": "stage2_check_cameras",
-      "mode": mode_label,
-      "dry_run": effective_dry_run,
-      "freshness": freshness,
-      "contact_sheet_shape": list(mosaic_rgb.shape),
-      "contact_sheet_path": contact_sheet_path,
-      "fk_projection_overlay_path": fk_overlay_path,
-      "recording": recording_info,
-  }
+  report = CameraCheckReport(
+      timestamp_utc=datetime.now(timezone.utc).isoformat(),
+      stage="stage2_check_cameras",
+      mode=mode_label,
+      dry_run=effective_dry_run,
+      freshness=freshness,
+      contact_sheet_shape=list(mosaic_rgb.shape),
+      contact_sheet_path=contact_sheet_path,
+      fk_projection_overlay_path=fk_overlay_path,
+      recording=recording_info,
+  )
 
   json_path = output_json or (
       resolved_out_dir / "camera_check_report.json"
@@ -289,14 +298,29 @@ def run_camera_check(
       else None
   )
   if json_path is not None:
+    report.report_path = str(json_path)
     json_path.parent.mkdir(parents=True, exist_ok=True)
-    json_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    report["report_path"] = str(json_path)
+    json_path.write_text(
+        json.dumps(report.to_dict(), indent=2) + "\n", encoding="utf-8"
+    )
 
+  fresh_ok = bool(
+      freshness["ok"] if isinstance(freshness, Mapping) else freshness.ok
+  )
+  fresh_cams = (
+      freshness["cameras"]
+      if isinstance(freshness, Mapping)
+      else freshness.cameras
+  )
+  fresh_errs = (
+      freshness.get("errors", [])
+      if isinstance(freshness, Mapping)
+      else freshness.errors
+  )
   tag = "[DRY-RUN]" if effective_dry_run else "[HARDWARE]"
   print(
-      f"{tag} Stage 2 Camera Check | ok={freshness['ok']} | "
-      f"streams={sorted(freshness['cameras'].keys())} | "
+      f"{tag} Stage 2 Camera Check | ok={fresh_ok} | "
+      f"streams={sorted(fresh_cams.keys())} | "
       f"mosaic={list(mosaic_rgb.shape)}"
   )
   if contact_sheet_path is not None:
@@ -310,7 +334,7 @@ def run_camera_check(
     )
   if json_path is not None:
     print(f"  report_json  : {json_path}")
-  for err in freshness.get("errors", []):
+  for err in fresh_errs:
     print(f"  ERROR: {err}", file=sys.stderr)
 
-  return (0 if freshness["ok"] else 1), report
+  return (0 if fresh_ok else 1), report

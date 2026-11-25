@@ -13,9 +13,12 @@
 # limitations under the License.
 """Portable macOS CAN bus bridge for i2rt (gs_usb, PCAN, SLCAN) without sudo."""
 
+from __future__ import annotations
+
 import atexit
 from collections import deque
 import ctypes.util
+import importlib
 import os
 import platform
 import re
@@ -28,10 +31,22 @@ import can
 _INSTALLED = False
 _HEALTH_CHECKED_KEYS: set[tuple[int, int]] = set()
 
+
+def _libusb_package_candidates() -> tuple[str, ...]:
+  """Returns the bundled dylib path from `libusb-package` if installed."""
+  try:
+    pkg = importlib.import_module("libusb_package")
+  except ImportError:
+    return ()
+  path = str(pkg.get_library_path())
+  return (path,) if path else ()
+
+
 _MACOS_LIBUSB_CANDIDATES = (
     "/opt/homebrew/lib/libusb-1.0.dylib",  # Apple Silicon Homebrew
-    "/usr/local/lib/libusb-1.0.dylib",     # Intel Homebrew
-    "/opt/local/lib/libusb-1.0.dylib",     # MacPorts
+    "/usr/local/lib/libusb-1.0.dylib",  # Intel Homebrew
+    "/opt/local/lib/libusb-1.0.dylib",  # MacPorts
+    *_libusb_package_candidates(),
 )
 
 
@@ -177,12 +192,19 @@ def _ensure_gs_usb_healthy(idx: int, bitrate: int, backend: Any) -> None:
         g.send(GsUsbFrame(can_id=0x7FF, data=[0] * 8))
         t0 = time.monotonic()
         while time.monotonic() - t0 < 0.03:
-            if g.read(frame=GsUsbFrame(), timeout_ms=2):
-                ok_ep81 = True
+            try:
+                if g.read(frame=GsUsbFrame(), timeout_ms=2):
+                    ok_ep81 = True
+                    break
+            except Exception:
                 break
         g.stop()
-        while g.read(frame=GsUsbFrame(), timeout_ms=2):
-            pass
+        while True:
+            try:
+                if not g.read(frame=GsUsbFrame(), timeout_ms=2):
+                    break
+            except Exception:
+                break
     finally:
         try:
             usb.util.release_interface(g.gs_usb, 0)
@@ -280,7 +302,7 @@ class MacGsUsbBus(can.BusABC):
     def _recv_internal(
         self, timeout: float | None
     ) -> tuple[can.Message | None, bool]:
-        wait_s = 0.005 if timeout is None else max(0.003, float(timeout))
+        wait_s = 0.010 if timeout is None else max(0.008, float(timeout))
         deadline = time.monotonic() + wait_s
         while True:
             with self._lock:
@@ -289,7 +311,10 @@ class MacGsUsbBus(can.BusABC):
                 if self._rx_queue:
                     return self._rx_queue.popleft(), False
                 rf = self._GsUsbFrame()
-                ok = self.gs_usb.read(frame=rf, timeout_ms=1)
+                try:
+                    ok = self.gs_usb.read(frame=rf, timeout_ms=2)
+                except Exception:
+                    ok = False
             if ok:
                 if rf.echo_id != self._NONE_ECHO_ID:
                     continue
